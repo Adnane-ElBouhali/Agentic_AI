@@ -18,15 +18,36 @@ try:
     from hackathon_starter_kit.models import AnswerItem
     from hackathon_starter_kit.models import Input
     from hackathon_starter_kit.tools.gitlab.clone import clone
+    from hackathon_starter_kit.tools.code.env_setup import create_venv
 except ModuleNotFoundError as exc:
     if exc.name != "hackathon_starter_kit":
         raise
     from models import AnswerItem
     from models import Input
     from tools.gitlab.clone import clone
+    from tools.code.env_setup import create_venv
+
+try:
+    from hackathon_starter_kit.tools.code.code_execution import execute_notebook
+    from hackathon_starter_kit.tools.code.code_execution import execute_python_file
+    from hackathon_starter_kit.tools.code.code_execution import execute_python_snippet
+except Exception:
+    execute_notebook = None
+    execute_python_file = None
+    execute_python_snippet = None
 
 
 DEFAULT_MODEL = "mistral-medium-2508"
+ROLE_MODEL_ENV = {
+    "classifier": ("LLM_MODEL_CLASSIFIER", "AGENT_MODEL_CLASSIFIER"),
+    "sufficiency": ("LLM_MODEL_SUFFICIENCY", "AGENT_MODEL_SUFFICIENCY"),
+    "execution": ("LLM_MODEL_EXECUTION", "AGENT_MODEL_EXECUTION"),
+    "answer": ("LLM_MODEL_ANSWER", "AGENT_MODEL_ANSWER"),
+    "verifier": ("LLM_MODEL_VERIFIER", "AGENT_MODEL_VERIFIER"),
+    "calibrator": ("LLM_MODEL_CALIBRATOR", "AGENT_MODEL_CALIBRATOR"),
+    "default": ("LLM_MODEL", "OPENAI_MODEL"),
+}
+_VENV_CACHE: dict[str, str] = {}
 
 MAX_CONTEXT_CHARS = 120_000
 MAX_QUESTION_CONTEXT_CHARS = 80_000
@@ -485,17 +506,60 @@ def _answer_with_tools(input: Input, snapshot: RepoSnapshot) -> list[dict[str, A
 def _answer_one_question(input: Input, snapshot: RepoSnapshot, question: Any) -> list[dict[str, Any]]:
     classification = _classify_question(input, snapshot, question)
     evidence = _collect_evidence(snapshot, question, classification)
-    execution_results = _execution_agent(input, snapshot, question, classification, evidence)
+    sufficiency = _evidence_sufficiency_judge(input, snapshot, question, classification, evidence)
+    evidence = _append_evidence_section(
+        evidence,
+        "Evidence Sufficiency Judgement",
+        json.dumps(sufficiency, ensure_ascii=True, indent=2),
+    )
+
+    if _sufficiency_requests_more_evidence(sufficiency):
+        evidence = _append_evidence_section(
+            evidence,
+            "Additional Evidence",
+            json.dumps(
+                _collect_requested_evidence(snapshot, sufficiency),
+                ensure_ascii=True,
+                indent=2,
+            ),
+        )
+        sufficiency = _evidence_sufficiency_judge(input, snapshot, question, classification, evidence)
+        evidence = _append_evidence_section(
+            evidence,
+            "Evidence Sufficiency Judgement After Additional Retrieval",
+            json.dumps(sufficiency, ensure_ascii=True, indent=2),
+        )
+
+    execution_results = []
+    if _sufficiency_requests_execution(sufficiency) or _should_execute(question.question, classification):
+        execution_results = _execution_agent(input, snapshot, question, classification, evidence)
     if execution_results:
         evidence = _append_evidence_section(
             evidence,
             "Execution Results",
             json.dumps(execution_results, ensure_ascii=True, indent=2),
         )
+        sufficiency = _evidence_sufficiency_judge(input, snapshot, question, classification, evidence)
+        evidence = _append_evidence_section(
+            evidence,
+            "Evidence Sufficiency Judgement After Execution",
+            json.dumps(sufficiency, ensure_ascii=True, indent=2),
+        )
+
+    if _sufficiency_marks_not_known(sufficiency):
+        answer = _fallback_answer(question.id)
+        answer["answer"] = str(
+            sufficiency.get(
+                "not_known_reason",
+                "The available data did not support an answer.",
+            )
+        )
+        answer["source_paths"] = []
+        return [answer]
 
     draft = _draft_answer(input, snapshot, question, classification, evidence)
-    reviewed = _critic_review(input, snapshot, question, classification, evidence, draft)
-    answer = reviewed or draft
+    verified = _adversarial_verify(input, snapshot, question, classification, evidence, draft)
+    answer = _confidence_calibrator(input, snapshot, question, classification, evidence, verified)
     if _answer_matches_question(answer, question.id):
         return [answer]
     return []
@@ -555,7 +619,7 @@ Targeted snippets:
             ),
         },
     ]
-    parsed = _safe_call_and_parse_json(input, messages, fallback)
+    parsed = _safe_call_and_parse_json(input, messages, fallback, "classifier")
     return {**fallback, **parsed}
 
 
@@ -606,6 +670,107 @@ def _collect_evidence(snapshot: RepoSnapshot, question: Any, classification: dic
     return sections
 
 
+def _evidence_sufficiency_judge(
+    input: Input,
+    snapshot: RepoSnapshot,
+    question: Any,
+    classification: dict[str, Any],
+    evidence: str,
+) -> dict[str, Any]:
+    fallback = {
+        "enough_evidence": False,
+        "should_answer": False,
+        "should_execute": _should_execute(question.question, classification),
+        "should_mark_not_known": False,
+        "not_known_reason": "",
+        "additional_files": [],
+        "additional_search_queries": [],
+        "confidence_ceiling": "medium",
+        "rationale": "Fallback sufficiency judgement.",
+    }
+    messages = [
+        {
+            "role": "system",
+            "content": """
+You are the Evidence Sufficiency Judge. Decide whether the current evidence is
+enough to answer one question, whether more retrieval/execution is needed, or
+whether the question should be marked not_known.
+Return JSON only:
+{
+  "enough_evidence": true,
+  "should_answer": true,
+  "should_execute": false,
+  "should_mark_not_known": false,
+  "not_known_reason": "",
+  "additional_files": ["relative/path.py"],
+  "additional_search_queries": ["query"],
+  "confidence_ceiling": "low" | "medium" | "high",
+  "rationale": "brief reason"
+}
+Mark not_known only when the evidence and repository inventory indicate the
+requested fact is absent or external. Request execution for runtime outputs,
+computed values, tests, or behavior that static evidence cannot settle.
+""".strip(),
+        },
+        {
+            "role": "user",
+            "content": _limit_text(
+                f"""
+Question id={question.id}: {question.question}
+
+Classifier:
+{json.dumps(classification, ensure_ascii=True, indent=2)}
+
+Repository tree:
+{snapshot.tree}
+
+Evidence packet:
+{evidence}
+""".strip(),
+                MAX_AGENT_CONTEXT_CHARS,
+            ),
+        },
+    ]
+    parsed = _safe_call_and_parse_json(input, messages, fallback, "sufficiency")
+    return {**fallback, **parsed}
+
+
+def _collect_requested_evidence(snapshot: RepoSnapshot, sufficiency: dict[str, Any]) -> dict[str, Any]:
+    collected: dict[str, Any] = {"files": [], "searches": []}
+    files = sufficiency.get("additional_files", [])
+    if isinstance(files, str):
+        files = [files]
+    if isinstance(files, list):
+        for path in files[:8]:
+            if str(path).strip():
+                collected["files"].append(_tool_read_file(snapshot.root, str(path).strip()))
+
+    queries = sufficiency.get("additional_search_queries", [])
+    if isinstance(queries, str):
+        queries = [queries]
+    if isinstance(queries, list):
+        for query in queries[:6]:
+            if str(query).strip():
+                collected["searches"].append(_tool_search(snapshot.root, str(query).strip()))
+    return collected
+
+
+def _sufficiency_requests_more_evidence(sufficiency: dict[str, Any]) -> bool:
+    if bool(sufficiency.get("enough_evidence")) or bool(sufficiency.get("should_mark_not_known")):
+        return False
+    files = sufficiency.get("additional_files", [])
+    queries = sufficiency.get("additional_search_queries", [])
+    return bool(files) or bool(queries)
+
+
+def _sufficiency_requests_execution(sufficiency: dict[str, Any]) -> bool:
+    return bool(sufficiency.get("should_execute")) and not bool(sufficiency.get("should_mark_not_known"))
+
+
+def _sufficiency_marks_not_known(sufficiency: dict[str, Any]) -> bool:
+    return bool(sufficiency.get("should_mark_not_known")) and not bool(sufficiency.get("should_answer"))
+
+
 def _execution_agent(
     input: Input,
     snapshot: RepoSnapshot,
@@ -627,15 +792,17 @@ one repository question. Return JSON only:
 {
   "actions": [
     {
-      "tool": "run_python" | "run_command",
+      "tool": "run_python" | "run_python_file" | "run_notebook" | "run_command",
       "code": "python snippet for run_python",
+      "path": "relative/path.py or notebook.ipynb for file/notebook execution",
       "args": ["python", "script.py"] for run_command,
       "reason": "why this execution is necessary"
     }
   ]
 }
 Use at most two actions. Prefer small Python snippets that import/call the relevant
-code or inspect data. Do not run destructive commands or long services.
+code or inspect data. Use run_notebook for notebook-output questions. Do not run
+destructive commands or long services.
 Return {"actions": []} if execution is not necessary after reading the evidence.
 """.strip(),
         },
@@ -655,14 +822,15 @@ Evidence:
             ),
         },
     ]
-    parsed = _safe_call_and_parse_json(input, messages, {"actions": []})
+    parsed = _safe_call_and_parse_json(input, messages, {"actions": []}, "execution")
     actions = parsed.get("actions")
     if not isinstance(actions, list):
         return []
     executable_actions = [
         action
         for action in actions[:2]
-        if isinstance(action, dict) and action.get("tool") in {"run_python", "run_command"}
+        if isinstance(action, dict)
+        and action.get("tool") in {"run_python", "run_python_file", "run_notebook", "run_command"}
     ]
     return _run_actions(snapshot.root, executable_actions, input.code_execution)
 
@@ -714,9 +882,145 @@ Evidence packet:
             ),
         },
     ]
-    parsed = _safe_call_and_parse_json(input, messages, {"answers": [fallback]})
+    parsed = _safe_call_and_parse_json(input, messages, {"answers": [fallback]}, "answer")
     answer = _extract_single_answer(parsed, question.id)
     return answer or fallback
+
+
+def _adversarial_verify(
+    input: Input,
+    snapshot: RepoSnapshot,
+    question: Any,
+    classification: dict[str, Any],
+    evidence: str,
+    draft: dict[str, Any],
+) -> dict[str, Any]:
+    fallback = draft or _fallback_answer(question.id)
+    messages = [
+        {
+            "role": "system",
+            "content": """
+You are the Adversarial Verifier Agent. Your task is to try to prove the draft
+answer wrong or unsupported using only the evidence packet. Be strict.
+Return one answer object as JSON only:
+{
+  "question": 123,
+  "answer": "verified or corrected answer",
+  "confidence": "low" | "medium" | "high",
+  "evidence": ["files"] or ["execution"] or ["files", "execution"] or [],
+  "not_known": false,
+  "source_paths": ["relative/path.py"],
+  "verification_notes": "brief note"
+}
+If the draft contains any fact not supported by evidence, rewrite it or mark
+not_known=true. Do not add new facts. Prefer not_known over a plausible guess.
+""".strip(),
+        },
+        {
+            "role": "user",
+            "content": _limit_text(
+                f"""
+Question id={question.id}: {question.question}
+
+Classifier:
+{json.dumps(classification, ensure_ascii=True, indent=2)}
+
+Draft answer:
+{json.dumps(draft, ensure_ascii=True, indent=2)}
+
+Evidence packet:
+{evidence}
+""".strip(),
+                MAX_AGENT_CONTEXT_CHARS,
+            ),
+        },
+    ]
+    parsed = _safe_call_and_parse_json(input, messages, fallback, "verifier")
+    answer = _extract_single_answer(parsed, question.id)
+    if answer is None and _answer_matches_question(parsed, question.id):
+        answer = parsed
+    return answer or fallback
+
+
+def _confidence_calibrator(
+    input: Input,
+    snapshot: RepoSnapshot,
+    question: Any,
+    classification: dict[str, Any],
+    evidence: str,
+    verified: dict[str, Any],
+) -> dict[str, Any]:
+    fallback = _deterministic_answer_calibration(verified or _fallback_answer(question.id))
+    messages = [
+        {
+            "role": "system",
+            "content": """
+You are the final Confidence Calibrator Agent. You may only adjust confidence,
+evidence, not_known, and wording to match the evidence. Return JSON only:
+{
+  "question": 123,
+  "answer": "final answer",
+  "confidence": "low" | "medium" | "high",
+  "evidence": ["files"] or ["execution"] or ["files", "execution"] or [],
+  "not_known": false,
+  "source_paths": ["relative/path.py"],
+  "calibration_notes": "brief reason"
+}
+Calibration rules:
+- not_known=true always means confidence low and evidence [].
+- high requires exact source_paths or successful execution output.
+- runtime/computed answers should be high only when execution output is present.
+- static facts directly shown in files can be high.
+- indirect but plausible source inference is medium.
+- weak or ambiguous support is low.
+""".strip(),
+        },
+        {
+            "role": "user",
+            "content": _limit_text(
+                f"""
+Question id={question.id}: {question.question}
+
+Classifier:
+{json.dumps(classification, ensure_ascii=True, indent=2)}
+
+Verified answer:
+{json.dumps(verified, ensure_ascii=True, indent=2)}
+
+Evidence packet:
+{evidence}
+""".strip(),
+                MAX_AGENT_CONTEXT_CHARS,
+            ),
+        },
+    ]
+    parsed = _safe_call_and_parse_json(input, messages, fallback, "calibrator")
+    answer = _extract_single_answer(parsed, question.id)
+    if answer is None and _answer_matches_question(parsed, question.id):
+        answer = parsed
+    return _deterministic_answer_calibration(answer or fallback)
+
+
+def _deterministic_answer_calibration(answer: dict[str, Any]) -> dict[str, Any]:
+    calibrated = dict(answer)
+    confidence = _normalize_confidence(calibrated.get("confidence"))
+    evidence = _normalize_evidence(calibrated.get("evidence"))
+    not_known = bool(calibrated.get("not_known", False))
+    answer_text = str(calibrated.get("answer") or "")
+    if _looks_unknown_answer(answer_text):
+        not_known = True
+    source_paths = _normalize_source_paths(calibrated.get("source_paths"))
+    confidence, evidence = _calibrate(confidence, evidence, not_known, source_paths)
+    calibrated["confidence"] = confidence
+    calibrated["evidence"] = evidence
+    calibrated["not_known"] = not_known
+    calibrated["source_paths"] = source_paths
+    if not str(calibrated.get("answer") or "").strip():
+        calibrated["answer"] = "The available data did not support an answer."
+        calibrated["not_known"] = True
+        calibrated["confidence"] = "low"
+        calibrated["evidence"] = []
+    return calibrated
 
 
 def _critic_review(
@@ -783,9 +1087,10 @@ def _safe_call_and_parse_json(
     input: Input,
     messages: list[dict[str, str]],
     fallback: dict[str, Any],
+    agent_role: str = "default",
 ) -> dict[str, Any]:
     try:
-        parsed = _call_and_parse_json(input, messages)
+        parsed = _call_and_parse_json(input, messages, agent_role)
         return parsed if isinstance(parsed, dict) else fallback
     except Exception as exc:
         print(f"[agent] JSON agent failed: {exc}")
@@ -1099,14 +1404,9 @@ def _answer_matches_question(answer: Any, question_id: int) -> bool:
         return False
 
 
-def _call_llm(input: Input, messages: list[dict[str, str]]) -> str:
+def _call_llm(input: Input, messages: list[dict[str, str]], agent_role: str = "default") -> str:
     client = _client(input)
-    model = _env_first(
-        "LLM_AS_A_SERVICE_MODEL",
-        "LLM_MODEL",
-        "OPENAI_MODEL",
-        default=DEFAULT_MODEL,
-    )
+    model = _model_for_role(agent_role)
 
     last_error: Exception | None = None
     for _ in range(3):
@@ -1123,8 +1423,12 @@ def _call_llm(input: Input, messages: list[dict[str, str]]) -> str:
     raise RuntimeError(f"LLM call failed after retries: {last_error}")
 
 
-def _call_and_parse_json(input: Input, messages: list[dict[str, str]]) -> dict[str, Any]:
-    content = _call_llm(input, messages)
+def _call_and_parse_json(
+    input: Input,
+    messages: list[dict[str, str]],
+    agent_role: str = "default",
+) -> dict[str, Any]:
+    content = _call_llm(input, messages, agent_role)
     try:
         return _parse_json(content)
     except RuntimeError:
@@ -1139,8 +1443,18 @@ def _call_and_parse_json(input: Input, messages: list[dict[str, str]]) -> dict[s
                 ),
             },
         ]
-        repaired = _call_llm(input, repair_messages)
+        repaired = _call_llm(input, repair_messages, agent_role)
         return _parse_json(repaired)
+
+
+def _model_for_role(agent_role: str) -> str:
+    role = agent_role if agent_role in ROLE_MODEL_ENV else "default"
+    names = ROLE_MODEL_ENV.get(role, ()) + (
+        "LLM_AS_A_SERVICE_MODEL",
+        "LLM_MODEL",
+        "OPENAI_MODEL",
+    )
+    return _env_first(*names, default=DEFAULT_MODEL)
 
 
 def _client(input: Input) -> Any:
@@ -1229,9 +1543,13 @@ def _run_actions(root: Path, actions: list[Any], code_execution: bool) -> list[d
                 result = _tool_search(root, str(action.get("query", "")))
             elif tool == "run_python" and code_execution:
                 result = _tool_run_python(root, str(action.get("code", "")))
+            elif tool == "run_python_file" and code_execution:
+                result = _tool_run_python_file(root, str(action.get("path", "")))
+            elif tool == "run_notebook" and code_execution:
+                result = _tool_run_notebook(root, str(action.get("path", "")))
             elif tool == "run_command" and code_execution:
                 result = _tool_run_command(root, action.get("args"))
-            elif tool in {"run_python", "run_command"}:
+            elif tool in {"run_python", "run_python_file", "run_notebook", "run_command"}:
                 result = {"error": "code execution is disabled"}
             else:
                 result = {"error": f"unknown tool: {tool}"}
@@ -1329,7 +1647,36 @@ def _tool_search(root: Path, query: str) -> dict[str, Any]:
 def _tool_run_python(root: Path, code: str) -> dict[str, str | int]:
     if not code.strip():
         return {"error": "empty python code"}
-    return _run_subprocess(root, [_python_for_repo(root), "-c", code], timeout=40)
+    venv_python = _python_for_repo(root)
+    if execute_python_snippet is not None:
+        output = execute_python_snippet(code, venv_python_path=venv_python)
+        return {"stdout": _truncate(output), "stderr": "", "exit_code": 0}
+    return _run_subprocess(root, [venv_python, "-c", code], timeout=40)
+
+
+def _tool_run_python_file(root: Path, relative_path: str) -> dict[str, str | int]:
+    path = _resolve_repo_file(root, relative_path)
+    if not path.exists() or not path.is_file():
+        return {"error": f"file not found: {relative_path}"}
+    if path.suffix.lower() != ".py":
+        return {"error": f"not a Python file: {relative_path}"}
+    venv_python = _python_for_repo(root)
+    if execute_python_file is not None:
+        output = execute_python_file(str(path), venv_python_path=venv_python)
+        return {"stdout": _truncate(output), "stderr": "", "exit_code": 0}
+    return _run_subprocess(root, [venv_python, str(path)], timeout=80)
+
+
+def _tool_run_notebook(root: Path, relative_path: str) -> dict[str, str | int]:
+    path = _resolve_repo_file(root, relative_path)
+    if not path.exists() or not path.is_file():
+        return {"error": f"file not found: {relative_path}"}
+    if path.suffix.lower() != ".ipynb":
+        return {"error": f"not a notebook file: {relative_path}"}
+    if execute_notebook is None:
+        return {"error": "notebook execution helper is unavailable"}
+    output = execute_notebook(str(path), venv_python_path=_python_for_repo(root))
+    return {"stdout": _truncate(output), "stderr": "", "exit_code": 0}
 
 
 def _tool_run_command(root: Path, args: Any) -> dict[str, str | int]:
@@ -1363,6 +1710,10 @@ def _tool_run_command(root: Path, args: Any) -> dict[str, str | int]:
 
 
 def _python_for_repo(root: Path) -> str:
+    cached = _VENV_CACHE.get(str(root))
+    if cached and Path(cached).exists():
+        return cached
+
     candidates = [
         root / ".venv" / "bin" / "python",
         root / "venv" / "bin" / "python",
@@ -1373,7 +1724,19 @@ def _python_for_repo(root: Path) -> str:
     ]
     for candidate in candidates:
         if candidate.exists():
+            _VENV_CACHE[str(root)] = str(candidate)
             return str(candidate)
+
+    should_build_env = os.getenv("AGENT_BUILD_REPO_ENV", "0").lower() in {"1", "true", "yes"}
+    if should_build_env and ((root / "requirements.txt").exists() or (root / "pyproject.toml").exists()):
+        try:
+            created = create_venv(str(root))
+        except Exception as exc:
+            print(f"[agent] Could not create repo venv: {exc}")
+        else:
+            if created and not str(created).startswith("[error]") and Path(created).exists():
+                _VENV_CACHE[str(root)] = str(created)
+                return str(created)
     return sys.executable
 
 
