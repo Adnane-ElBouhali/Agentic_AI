@@ -11,19 +11,26 @@ from typing import Any
 
 
 DEFAULT_PATHS = [
-    "s3://ds-hackathon",
-    "s3://ds-hackathon/data",
-    "s3://ds-hackathon/data/granting_score",
-    "s3://ds-hackathon/data/granting-score",
-    "s3://ds-hackathon/data/legal-report",
-    "s3://ds-hackathon/data/Perimeter_Data_Updated_20250221.csv",
-    "s3://ds-hackathon/data/Perimeter_Data_Updated_20250221.parquet",
-    "s3://hackathon",
-    "s3://hackathon/data",
-    "s3://hackathon/data/granting_score",
-    "s3://hackathon/data/legal-report",
-    "s3+default://ds-hackathon",
-    "s3+default://ds-hackathon/data",
+    "s3+cos://ds-hackalton",
+    "s3+cos://ds-hackalton/data",
+    "s3+cos://ds-hackalton/data/granting_score",
+    "s3+cos://ds-hackalton/data/granting-score",
+    "s3+cos://ds-hackalton/data/legal-report",
+    "s3+cos://ds-hackalton/data/Perimeter_Data_Updated_2025022.csv",
+    "s3+cos://ds-hackalton/data/Perimeter_Data_Updated_20250221.csv",
+    "s3+cos://ds-hackalton/data/Perimeter_Data_Updated_2025022.parquet",
+    "s3+cos://ds-hackalton/data/Perimeter_Data_Updated_20250221.parquet",
+    "ds-hackalton",
+    "ds-hackalton/data",
+    "ds-hackalton/data/granting_score",
+    "ds-hackalton/data/granting-score",
+    "ds-hackalton/data/legal-report",
+    "ds-hackalton/data/Perimeter_Data_Updated_2025022.csv",
+    "ds-hackalton/data/Perimeter_Data_Updated_20250221.csv",
+    "ds-hackalton/data/Perimeter_Data_Updated_2025022.parquet",
+    "ds-hackalton/data/Perimeter_Data_Updated_20250221.parquet",
+    "s3+cos://ds-hackathon/data",
+    "ds-hackathon/data",
 ]
 
 
@@ -34,7 +41,7 @@ def main() -> int:
     parser.add_argument(
         "paths",
         nargs="*",
-        help="Optional Sparrow paths to test. Defaults to ds-hackathon candidates.",
+        help="Optional Sparrow paths to test. Defaults to s3+cos and plain ds-hackalton candidates.",
     )
     parser.add_argument(
         "--max-bytes",
@@ -76,6 +83,12 @@ def main() -> int:
 
 def _env_status() -> dict[str, bool]:
     keys = [
+        "SPARROW_FLOW_IO_S3__TENANTS__COS__URL",
+        "SPARROW_FLOW_IO_S3__TENANTS__COS__STATIC_CREDENTIALS__ACCESS_KEY",
+        "SPARROW_FLOW_IO_S3__TENANTS__COS__STATIC_CREDENTIALS__SECRET_KEY",
+        "SPARROW_FLOW_IO_S3__TENANTS__cos__URL",
+        "SPARROW_FLOW_IO_S3__TENANTS__cos__STATIC_CREDENTIALS__ACCESS_KEY",
+        "SPARROW_FLOW_IO_S3__TENANTS__cos__STATIC_CREDENTIALS__SECRET_KEY",
         "SPARROW_FLOW_IO_S3__TENANTS__default__STATIC_CREDENTIALS__ACCESS_KEY",
         "SPARROW_FLOW_IO_S3__TENANTS__default__STATIC_CREDENTIALS__SECRET_KEY",
         "SPARROW_FLOW_IO_OBJS__ACCESS_KEY",
@@ -134,8 +147,13 @@ def _import_status() -> dict[str, Any]:
 
 def _check_path(path: str, create_path: Any, open_file: Any, max_bytes: int) -> dict[str, Any]:
     item: dict[str, Any] = {"path": path, "create_path": None, "list": None, "open": None}
-    if create_path is not None:
+    if create_path is not None and _is_create_path_uri(path):
         item["create_path"] = _try_create_and_list(path, create_path)
+    elif create_path is not None:
+        item["create_path"] = {
+            "ok": False,
+            "skipped": "plain paths are tested with open_file; use s3+cos://... for create_path",
+        }
     else:
         item["create_path"] = {"ok": False, "error": "create_path unavailable"}
 
@@ -144,6 +162,10 @@ def _check_path(path: str, create_path: Any, open_file: Any, max_bytes: int) -> 
     else:
         item["open"] = {"ok": False, "error": "open_file unavailable"}
     return item
+
+
+def _is_create_path_uri(path: str) -> bool:
+    return str(path).startswith("s3+")
 
 
 def _try_create_and_list(path: str, create_path: Any) -> dict[str, Any]:
