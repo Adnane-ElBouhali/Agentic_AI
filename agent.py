@@ -156,6 +156,9 @@ class RepoSnapshot:
     tree: str
     context: str
     files: list[Path]
+    all_files: list[Path]
+    symbols: str
+    metadata: str
 
 
 def predict(input: Input) -> List[AnswerItem]:
@@ -198,8 +201,11 @@ def _copy_local_repo(source: Path, dest: Path) -> None:
 
 
 def _build_snapshot(root: Path, questions: Iterable[Any]) -> RepoSnapshot:
-    files = list(_iter_files(root))
-    tree = _format_tree(root, files)
+    all_files = list(_iter_all_files(root))
+    files = [path for path in all_files if _looks_textual(path) and path.stat().st_size <= 700_000]
+    tree = _format_tree(root, all_files)
+    symbols = _build_symbol_index(root, files)
+    metadata = _repo_metadata(root)
     question_text = " ".join(getattr(question, "question", "") for question in questions)
     ranked = sorted(files, key=lambda path: _file_priority(root, path, question_text), reverse=True)
 
@@ -217,15 +223,31 @@ def _build_snapshot(root: Path, questions: Iterable[Any]) -> RepoSnapshot:
         chunks.append(chunk)
         total += len(chunk)
 
-    return RepoSnapshot(root=root, tree=tree, context="".join(chunks), files=files)
+    return RepoSnapshot(
+        root=root,
+        tree=tree,
+        context="".join(chunks),
+        files=files,
+        all_files=all_files,
+        symbols=symbols,
+        metadata=metadata,
+    )
+
+
+def _iter_all_files(root: Path) -> Iterable[Path]:
+    for path in root.rglob("*"):
+        try:
+            rel_parts = path.relative_to(root).parts
+        except ValueError:
+            continue
+        if any(part in SKIPPED_DIRS for part in rel_parts):
+            continue
+        if path.is_file():
+            yield path
 
 
 def _iter_files(root: Path) -> Iterable[Path]:
-    for path in root.rglob("*"):
-        if any(part in SKIPPED_DIRS for part in path.relative_to(root).parts):
-            continue
-        if not path.is_file():
-            continue
+    for path in _iter_all_files(root):
         if path.stat().st_size > 700_000:
             continue
         if _looks_textual(path):
@@ -250,11 +272,85 @@ def _format_tree(root: Path, files: list[Path]) -> str:
             size = path.stat().st_size
         except OSError:
             size = 0
-        lines.append(f"{_rel(root, path)} ({size} bytes)")
+        kind = "text" if _looks_textual(path) else "binary"
+        lines.append(f"{_rel(root, path)} ({size} bytes, {kind})")
     extra = max(0, len(files) - len(lines))
     if extra:
         lines.append(f"... {extra} more files")
     return "\n".join(lines)
+
+
+def _repo_metadata(root: Path) -> str:
+    fields = []
+    for args, label in (
+        (["git", "rev-parse", "--short", "HEAD"], "commit"),
+        (["git", "branch", "--show-current"], "branch"),
+        (["git", "remote", "-v"], "remotes"),
+    ):
+        try:
+            result = subprocess.run(
+                args,
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except Exception:
+            continue
+        value = result.stdout.strip()
+        if result.returncode == 0 and value:
+            fields.append(f"{label}: {value[:1200]}")
+    return "\n".join(fields) if fields else "No git metadata available."
+
+
+def _build_symbol_index(root: Path, files: list[Path]) -> str:
+    entries: list[str] = []
+    for path in sorted(files, key=lambda item: _rel(root, item).lower()):
+        if len(entries) >= 260:
+            break
+        suffix = path.suffix.lower()
+        if suffix == ".py":
+            entries.extend(_python_symbols(root, path))
+        elif suffix in {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}:
+            entries.extend(_javascript_symbols(root, path))
+    if not entries:
+        return "No source symbols detected."
+    return "\n".join(entries[:260])
+
+
+def _python_symbols(root: Path, path: Path) -> list[str]:
+    try:
+        import ast
+
+        tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return []
+
+    entries = []
+    rel = _rel(root, path)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            kind = "class" if isinstance(node, ast.ClassDef) else "function"
+            entries.append(f"{rel}:{node.lineno} {kind} {node.name}")
+    return entries
+
+
+def _javascript_symbols(root: Path, path: Path) -> list[str]:
+    text = _read_text(path, MAX_SEARCH_FILE_CHARS)
+    entries = []
+    rel = _rel(root, path)
+    patterns = [
+        (r"\b(?:export\s+)?class\s+([A-Za-z_$][\w$]*)", "class"),
+        (r"\b(?:export\s+)?function\s+([A-Za-z_$][\w$]*)", "function"),
+        (r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?\(", "function"),
+    ]
+    lines = text.splitlines()
+    for index, line in enumerate(lines, start=1):
+        for pattern, kind in patterns:
+            for match in re.finditer(pattern, line):
+                entries.append(f"{rel}:{index} {kind} {match.group(1)}")
+    return entries
 
 
 def _file_priority(root: Path, path: Path, question_text: str) -> tuple[int, int, int, int, str]:
@@ -420,6 +516,14 @@ Use the repository tree, file contents, and any tool results to answer accuratel
 Questions may require source-code analysis, code execution, or recognizing that the
 available data is insufficient. {execution_note}
 
+Your score depends on both answer correctness and confidence calibration. Think like
+an evidence-gathering agent:
+- Use source_paths for files/snippets that directly support the answer.
+- Request search/read_file when the targeted context is not enough.
+- Request execution when the question asks for runtime output, computed values, or
+  behavior that cannot be known confidently from static reading.
+- If no evidence supports the requested fact, do not infer or invent it.
+
 Return JSON only. The JSON schema is:
 {{
   "actions": [
@@ -451,6 +555,8 @@ confidence low, evidence to [], and explain briefly that the available data does
 support the answer. Do not hallucinate.
 Calibrate confidence: high only for direct evidence or successful execution, medium
 for strong inference, low for partial or missing evidence.
+Do not use high confidence unless source_paths is non-empty or evidence includes
+"execution". If you used an execution result, include "execution" in evidence.
 Use source_paths for your own grounding; the final API may ignore it.
 """.strip()
 
@@ -458,20 +564,98 @@ Use source_paths for your own grounding; the final API may ignore it.
 def _question_prompt(input: Input, snapshot: RepoSnapshot, question: Any) -> str:
     question_text = getattr(question, "question", "")
     context = _question_context(snapshot, question_text)
+    hints = _question_hints(question_text, input.code_execution)
+    search_hits = _question_search_context(snapshot, question_text)
     return f"""
 Template: {input.template_title}
 
 Question:
 - id={question.id}: {question_text}
 
+Likely approach:
+{hints}
+
+Challenge rubric:
+- Some questions are answered by source-code/file analysis.
+- Some questions require executing code to observe the answer.
+- Some questions cannot be answered from the repository or available resources.
+- For unanswerable questions: set not_known=true, confidence="low", evidence=[].
+- Avoid both overconfidence and underconfidence; the judge penalizes miscalibration.
+
+Repository metadata:
+{snapshot.metadata}
+
 Repository tree:
 {snapshot.tree}
+
+Source symbol index:
+{snapshot.symbols}
+
+Pre-search hits for this question:
+{search_hits}
 
 Targeted repository contents:
 {context}
 
 Answer question id {question.id} exactly once. Prefer concise but complete answers.
+Use high confidence only when the answer is directly supported by file paths/snippets
+or successful execution. If the question asks for a runtime value/output and execution
+is enabled, request a run_python or run_command action before finalizing.
 """.strip()
+
+
+def _question_hints(question_text: str, code_execution: bool) -> str:
+    lowered = question_text.lower()
+    execution_markers = (
+        "execute",
+        "run",
+        "output",
+        "prints",
+        "printed",
+        "result",
+        "returns",
+        "value",
+        "evaluate",
+        "calculate",
+        "compute",
+        "shape",
+    )
+    missing_markers = (
+        "author",
+        "created",
+        "email",
+        "phone",
+        "owner",
+        "password",
+        "secret",
+        "token",
+        "outside",
+    )
+    if any(marker in lowered for marker in execution_markers):
+        if code_execution:
+            return "Likely execution question. Use file analysis to locate code, then execute a minimal snippet or command before answering."
+        return "Likely execution question, but execution is disabled. Answer from files only and lower confidence if runtime behavior is uncertain."
+    if any(marker in lowered for marker in missing_markers):
+        return "May be unanswerable if the requested fact is not in files or tool results. Prefer not_known=true over guessing."
+    return "Likely source/documentation analysis question. Cite source_paths and answer from repository evidence."
+
+
+def _question_search_context(snapshot: RepoSnapshot, question_text: str) -> str:
+    tokens = sorted(_tokenize(question_text))
+    if not tokens:
+        return "No useful search terms."
+    query = " ".join(tokens[:8])
+    result = _tool_search(snapshot.root, query)
+    matches = result.get("matches", []) if isinstance(result, dict) else []
+    if not matches:
+        return "No direct pre-search hits."
+    lines = []
+    for match in matches[:10]:
+        path = match.get("path", "")
+        line = match.get("line", "")
+        snippet = str(match.get("snippet", "")).replace("\n", "\n  ")
+        lines.append(f"- {path}:{line}\n  {snippet}")
+    return "\n".join(lines)
 
 
 def _tool_result_prompt(question: Any, results: list[dict[str, Any]]) -> str:
@@ -646,10 +830,31 @@ def _run_actions(root: Path, actions: list[Any], code_execution: bool) -> list[d
 
 
 def _tool_read_file(root: Path, relative_path: str) -> dict[str, str]:
-    path = _safe_path(root, relative_path)
+    path = _resolve_repo_file(root, relative_path)
     if not path.exists() or not path.is_file():
         return {"error": f"file not found: {relative_path}"}
     return {"path": _rel(root, path), "content": _read_text(path, MAX_TOOL_OUTPUT_CHARS)}
+
+
+def _resolve_repo_file(root: Path, relative_path: str) -> Path:
+    try:
+        path = _safe_path(root, relative_path)
+    except ValueError:
+        raise
+    if path.exists():
+        return path
+
+    cleaned = relative_path.strip().replace("\\", "/").strip("/")
+    if not cleaned:
+        return path
+    candidates = []
+    for candidate in _iter_files(root):
+        rel = _rel(root, candidate)
+        if rel == cleaned or rel.endswith(f"/{cleaned}") or candidate.name == cleaned:
+            candidates.append(candidate)
+    if len(candidates) == 1:
+        return candidates[0]
+    return path
 
 
 def _tool_search(root: Path, query: str) -> dict[str, Any]:
@@ -806,7 +1011,8 @@ def _coerce_answers(input: Input, raw_answers: list[dict[str, Any]]) -> List[Ans
         if _looks_unknown_answer(answer_text):
             not_known = True
 
-        confidence, evidence = _calibrate(confidence, evidence, not_known)
+        source_paths = _normalize_source_paths(raw.get("source_paths"))
+        confidence, evidence = _calibrate(confidence, evidence, not_known, source_paths)
 
         results.append(
             AnswerItem(
@@ -861,13 +1067,30 @@ def _normalize_evidence(value: Any) -> list[str]:
     return evidence
 
 
-def _calibrate(confidence: str, evidence: list[str], not_known: bool) -> tuple[str, list[str]]:
+def _normalize_source_paths(value: Any) -> list[str]:
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def _calibrate(
+    confidence: str,
+    evidence: list[str],
+    not_known: bool,
+    source_paths: list[str],
+) -> tuple[str, list[str]]:
     if not_known:
+        return "low", []
+    if not evidence:
         return "low", []
     if "execution" in evidence and confidence == "low":
         return "medium", evidence
     if "files" in evidence and "execution" in evidence and confidence == "medium":
         return "high", evidence
+    if confidence == "high" and "execution" not in evidence and not source_paths:
+        return "medium", evidence
     return confidence, evidence
 
 
