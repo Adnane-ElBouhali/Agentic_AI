@@ -41,6 +41,7 @@ DEFAULT_MODEL = "mistral-medium-2508"
 ROLE_MODEL_ENV = {
     "classifier": ("LLM_MODEL_CLASSIFIER", "AGENT_MODEL_CLASSIFIER"),
     "sufficiency": ("LLM_MODEL_SUFFICIENCY", "AGENT_MODEL_SUFFICIENCY"),
+    "dataset": ("LLM_MODEL_DATASET", "AGENT_MODEL_DATASET"),
     "execution": ("LLM_MODEL_EXECUTION", "AGENT_MODEL_EXECUTION"),
     "answer": ("LLM_MODEL_ANSWER", "AGENT_MODEL_ANSWER"),
     "verifier": ("LLM_MODEL_VERIFIER", "AGENT_MODEL_VERIFIER"),
@@ -56,10 +57,91 @@ MAX_AGENT_CONTEXT_CHARS = 90_000
 MAX_FILE_CHARS = 12_000
 MAX_TOOL_OUTPUT_CHARS = 18_000
 MAX_TOOL_ROUNDS = 3
+MAX_DATASET_OUTPUT_CHARS = 45_000
 MAX_SEARCH_FILE_CHARS = 220_000
 MAX_SEARCH_MATCHES = 40
 MAX_SNIPPETS_PER_FILE = 4
 SEARCH_WINDOW_LINES = 2
+
+SPARROW_DATASET_NAME = "ds-hackathon"
+SPARROW_DATASET_GUIDE = """
+Sparrow dataset context supplied by the challenge:
+- Dataset id/name: ds-hackathon, display name: hackathon.
+- Important dataset folders/files shown in Sparrow Studio:
+  - data/granting_score/
+  - data/granting-score/
+  - data/legal-report/
+  - data/Perimeter_Data_Updated_20250221.csv
+  - data/Perimeter_Data_Updated_20250221.parquet
+  - auto/
+  - full_data/
+  - modelling_outputs/
+  - 3_1_4_B_manual_rfe_table.parquet
+  - 3_4_1_B_Segmentation_Study_ML_Feature_selection... files
+  - 3_4_2_B_Annex_HyperOpt_HyperParameter... files
+  - 3_4_2_B_BROKERS_results_df.parquet
+  - 3_4_2_B_DIRECTO_results_df.parquet
+  - 3_4_2_B_dist_results_df.parquet
+- Sparrow Flow IO docs:
+  - sparrow_flow.io.functional.open_file(filepath, mode="rb", force_local=False)
+    opens local/S3 paths as streams.
+  - sparrow_flow.io.path.create_path(path, force_local=False) creates LocalPath
+    or S3Path. s3:// URIs create S3 paths; s3+tenant:// can select an S3 tenant.
+  - S3Path.open works like pathlib.Path.open.
+  - read_dataframe/save_dataframe support schema/dtype for column types.
+Use this dataset for questions about granting score, legal reports, scoring,
+perimeters, model outputs, segmentation, brokers, DIRECTO, distance, RFE, or
+HyperOpt/hyperparameters.
+""".strip()
+
+DATASET_ROOT_CANDIDATES = [
+    "s3://ds-hackathon",
+    "s3://ds-hackathon/data",
+    "s3://hackathon",
+    "s3://hackathon/data",
+    "s3://orgasparrow-ykkuk/ds-hackathon",
+    "s3://orgasparrow-ykkuk/ds-hackathon/data",
+    "s3+default://ds-hackathon",
+    "s3+default://ds-hackathon/data",
+]
+
+DATASET_KNOWN_PATHS = [
+    "data/granting_score",
+    "data/granting-score",
+    "data/legal-report",
+    "data/Perimeter_Data_Updated_20250221.csv",
+    "data/Perimeter_Data_Updated_20250221.parquet",
+    "auto",
+    "data",
+    "full_data",
+    "modelling_outputs",
+    "3_1_4_B_manual_rfe_table.parquet",
+    "3_4_2_B_BROKERS_results_df.parquet",
+    "3_4_2_B_DIRECTO_results_df.parquet",
+    "3_4_2_B_dist_results_df.parquet",
+]
+
+DATASET_KEYWORDS = {
+    "annex",
+    "broker",
+    "brokers",
+    "directo",
+    "distance",
+    "dist",
+    "grant",
+    "granting",
+    "hyperopt",
+    "hyperparameter",
+    "legal",
+    "manual",
+    "modelling",
+    "perimeter",
+    "rfe",
+    "report",
+    "score",
+    "scoring",
+    "segmentation",
+}
 
 TOKEN_RE = re.compile(r"[a-zA-Z0-9_]{3,}")
 STOP_WORDS = {
@@ -189,6 +271,7 @@ def predict(input: Input) -> List[AnswerItem]:
 
     repo_dir = Path(tempfile.mkdtemp(prefix=f"submission-{input.submission_id}-"))
     try:
+        _prime_sparrow_data_env(input)
         _materialize_repo(input, repo_dir)
         snapshot = _build_snapshot(repo_dir, input.template)
         raw_answers = _answer_with_tools(input, snapshot)
@@ -198,6 +281,10 @@ def predict(input: Input) -> List[AnswerItem]:
         return [_unknown_answer(question.id, f"Agent error: {exc}") for question in input.template]
     finally:
         shutil.rmtree(repo_dir, ignore_errors=True)
+
+
+def _prime_sparrow_data_env(input: Input) -> None:
+    os.environ.update(_sparrow_data_env(input))
 
 
 def _materialize_repo(input: Input, dest: Path) -> None:
@@ -506,6 +593,9 @@ def _answer_with_tools(input: Input, snapshot: RepoSnapshot) -> list[dict[str, A
 def _answer_one_question(input: Input, snapshot: RepoSnapshot, question: Any) -> list[dict[str, Any]]:
     classification = _classify_question(input, snapshot, question)
     evidence = _collect_evidence(snapshot, question, classification)
+    dataset_evidence = _dataset_investigator(input, snapshot, question, classification)
+    if dataset_evidence:
+        evidence = _append_evidence_section(evidence, "Sparrow Dataset Evidence", dataset_evidence)
     sufficiency = _evidence_sufficiency_judge(input, snapshot, question, classification, evidence)
     evidence = _append_evidence_section(
         evidence,
@@ -518,7 +608,7 @@ def _answer_one_question(input: Input, snapshot: RepoSnapshot, question: Any) ->
             evidence,
             "Additional Evidence",
             json.dumps(
-                _collect_requested_evidence(snapshot, sufficiency),
+                _collect_requested_evidence(input, snapshot, question, sufficiency),
                 ensure_ascii=True,
                 indent=2,
             ),
@@ -609,6 +699,9 @@ Repository tree:
 Source symbol index:
 {snapshot.symbols}
 
+External Sparrow dataset guide:
+{SPARROW_DATASET_GUIDE}
+
 Pre-search hits:
 {_question_search_context(snapshot, question_text)}
 
@@ -670,6 +763,470 @@ def _collect_evidence(snapshot: RepoSnapshot, question: Any, classification: dic
     return sections
 
 
+def _dataset_investigator(
+    input: Input,
+    snapshot: RepoSnapshot,
+    question: Any,
+    classification: dict[str, Any],
+) -> str:
+    question_text = getattr(question, "question", "")
+    fallback = _fallback_dataset_plan(question_text, classification)
+    if not fallback.get("use_dataset"):
+        return ""
+
+    messages = [
+        {
+            "role": "system",
+            "content": """
+You are the Sparrow Dataset Investigator planner. Decide whether the external
+Sparrow dataset should be queried for this question and which dataset paths or
+search terms matter.
+Return JSON only:
+{
+  "use_dataset": true,
+  "reason": "why dataset evidence is relevant",
+  "paths": ["data/legal-report", "data/granting_score"],
+  "search_terms": ["granting score", "legal report"],
+  "calculations": ["describe computation if needed"]
+}
+Use the dataset for granting score, legal report, scoring, perimeter, model output,
+segmentation, broker, DIRECTO, distance, RFE, HyperOpt, or hyperparameter questions.
+""".strip(),
+        },
+        {
+            "role": "user",
+            "content": _limit_text(
+                f"""
+Question id={question.id}: {question_text}
+
+Classifier:
+{json.dumps(classification, ensure_ascii=True, indent=2)}
+
+Dataset guide:
+{SPARROW_DATASET_GUIDE}
+
+Repository tree:
+{snapshot.tree}
+""".strip(),
+                MAX_AGENT_CONTEXT_CHARS,
+            ),
+        },
+    ]
+    plan = _safe_call_and_parse_json(input, messages, fallback, "dataset")
+    plan = {**fallback, **plan}
+    if not bool(plan.get("use_dataset")):
+        return ""
+
+    paths = _dataset_candidate_paths(question_text, plan)
+    probe = _probe_sparrow_dataset(input, question_text, paths, plan)
+    return _limit_text(
+        f"""
+Dataset guide:
+{SPARROW_DATASET_GUIDE}
+
+Dataset plan:
+{json.dumps(plan, ensure_ascii=True, indent=2)}
+
+Candidate dataset paths:
+{json.dumps(paths, ensure_ascii=True, indent=2)}
+
+Dataset probe result:
+{json.dumps(probe, ensure_ascii=True, indent=2)}
+""".strip(),
+        MAX_DATASET_OUTPUT_CHARS,
+    )
+
+
+def _fallback_dataset_plan(question_text: str, classification: dict[str, Any]) -> dict[str, Any]:
+    tokens = _tokenize(question_text)
+    query_blob = " ".join(str(item) for item in classification.get("search_queries", []))
+    class_blob = f"{question_text} {query_blob} {classification.get('risk_notes', '')}".lower()
+    use_dataset = bool(tokens & DATASET_KEYWORDS) or any(
+        keyword in class_blob for keyword in DATASET_KEYWORDS
+    )
+    paths = []
+    terms = sorted(tokens & DATASET_KEYWORDS)
+    lowered = class_blob
+    if "legal" in lowered or "report" in lowered:
+        paths.append("data/legal-report")
+    if "grant" in lowered or "score" in lowered:
+        paths.extend(["data/granting_score", "data/granting-score"])
+    if "perimeter" in lowered:
+        paths.extend(
+            [
+                "data/Perimeter_Data_Updated_20250221.csv",
+                "data/Perimeter_Data_Updated_20250221.parquet",
+            ]
+        )
+    if any(word in lowered for word in ("broker", "directo", "dist", "rfe", "hyperopt", "segmentation")):
+        paths.extend(["data/granting_score", "data/granting-score", "modelling_outputs"])
+    return {
+        "use_dataset": use_dataset,
+        "reason": "Question appears related to Sparrow external challenge dataset." if use_dataset else "",
+        "paths": paths,
+        "search_terms": terms or _default_queries(question_text)[:3],
+        "calculations": [],
+    }
+
+
+def _dataset_candidate_paths(question_text: str, plan: dict[str, Any]) -> list[str]:
+    raw_paths = plan.get("paths", [])
+    if isinstance(raw_paths, str):
+        raw_paths = [raw_paths]
+
+    relative_paths = []
+    for path in [*DATASET_KNOWN_PATHS, *raw_paths]:
+        text = str(path).strip().replace("\\", "/").strip("/")
+        if text and text not in relative_paths:
+            relative_paths.append(text)
+
+    lowered = question_text.lower()
+    focused = []
+    for path in relative_paths:
+        path_lower = path.lower()
+        if (
+            any(token in path_lower for token in _tokenize(question_text))
+            or ("legal" in lowered and "legal" in path_lower)
+            or ("report" in lowered and "report" in path_lower)
+            or ("grant" in lowered and "grant" in path_lower)
+            or ("score" in lowered and "granting" in path_lower)
+            or ("perimeter" in lowered and "perimeter" in path_lower)
+            or path in DATASET_KNOWN_PATHS[:5]
+        ):
+            focused.append(path)
+
+    if not focused:
+        focused = relative_paths[:8]
+
+    candidates = []
+    for root in DATASET_ROOT_CANDIDATES:
+        root = root.rstrip("/")
+        candidates.append(root)
+        for path in focused[:12]:
+            if path.startswith("s3://") or path.startswith("s3+"):
+                uri = path
+            elif root.endswith("/data") and path.startswith("data/"):
+                uri = f"{root}/{path[5:]}"
+            else:
+                uri = f"{root}/{path}"
+            if uri not in candidates:
+                candidates.append(uri)
+    return candidates[:80]
+
+
+def _probe_sparrow_dataset(
+    input: Input,
+    question_text: str,
+    candidate_paths: list[str],
+    plan: dict[str, Any],
+) -> dict[str, Any]:
+    code = _dataset_probe_code(question_text, candidate_paths, plan)
+    return _run_agent_python(code, _sparrow_data_env(input), timeout=120)
+
+
+def _dataset_probe_code(question_text: str, candidate_paths: list[str], plan: dict[str, Any]) -> str:
+    payload = {
+        "question": question_text,
+        "candidate_paths": candidate_paths,
+        "search_terms": plan.get("search_terms", []),
+    }
+    return f"""
+import io
+import json
+import os
+import pickle
+import re
+import sys
+
+payload = {json.dumps(payload, ensure_ascii=True)}
+question = payload.get("question", "")
+candidate_paths = payload.get("candidate_paths", [])
+search_terms = [str(x).lower() for x in payload.get("search_terms", []) if str(x).strip()]
+tokens = set(re.findall(r"[a-zA-Z0-9_]+", question.lower())) | set(search_terms)
+tokens = {{t for t in tokens if len(t) >= 3}}
+out = {{"available": False, "imports": {{}}, "listed": [], "summaries": [], "errors": []}}
+
+try:
+    from sparrow_flow.io.path import create_path
+    out["imports"]["create_path"] = True
+except Exception as exc:
+    create_path = None
+    out["imports"]["create_path"] = False
+    out["errors"].append(f"create_path import failed: {{exc}}")
+
+try:
+    from sparrow_flow.io.functional import open_file
+    out["imports"]["open_file"] = True
+except Exception as exc:
+    open_file = None
+    out["imports"]["open_file"] = False
+    out["errors"].append(f"open_file import failed: {{exc}}")
+
+try:
+    import pandas as pd
+    out["imports"]["pandas"] = True
+except Exception as exc:
+    pd = None
+    out["imports"]["pandas"] = False
+
+try:
+    import pyarrow.parquet as pq
+    out["imports"]["pyarrow"] = True
+except Exception:
+    pq = None
+    out["imports"]["pyarrow"] = False
+
+
+def score_path(value):
+    lower = str(value).lower()
+    score = sum(1 for token in tokens if token in lower)
+    for keyword in ("granting", "grant", "score", "legal", "report", "perimeter", "hyperopt", "broker", "directo", "dist", "rfe", "segmentation"):
+        if keyword in lower and keyword in question.lower():
+            score += 3
+    return score
+
+
+def list_entries(uri):
+    if create_path is None:
+        return []
+    entries = []
+    try:
+        p = create_path(uri)
+    except Exception as exc:
+        out["errors"].append(f"create_path({{uri}}) failed: {{exc}}")
+        return []
+    for method_name, pattern in (("iterdir", None), ("glob", "*"), ("rglob", "*")):
+        try:
+            method = getattr(p, method_name)
+        except Exception:
+            continue
+        try:
+            iterator = method(pattern) if pattern is not None else method()
+            for idx, child in enumerate(iterator):
+                if idx >= 80:
+                    break
+                entries.append(str(child))
+        except Exception as exc:
+            if method_name == "iterdir":
+                out["errors"].append(f"list {{uri}} via {{method_name}} failed: {{exc}}")
+        if entries:
+            break
+    if entries:
+        out["available"] = True
+        out["listed"].append({{"uri": uri, "entries": entries[:80]}})
+    return entries
+
+
+def read_bytes(uri, max_bytes=300000):
+    if open_file is None:
+        return None
+    try:
+        with open_file(uri, "rb") as stream:
+            return stream.read(max_bytes)
+    except Exception as exc:
+        out["errors"].append(f"read {{uri}} failed: {{exc}}")
+        return None
+
+
+def summarize_text(uri, data):
+    try:
+        text = data.decode("utf-8", errors="replace")
+    except Exception:
+        text = repr(data[:1000])
+    hits = []
+    for line_no, line in enumerate(text.splitlines(), start=1):
+        low = line.lower()
+        if any(token in low for token in tokens):
+            hits.append({{"line": line_no, "text": line[:500]}})
+        if len(hits) >= 12:
+            break
+    out["summaries"].append({{
+        "uri": uri,
+        "kind": "text",
+        "preview": text[:2500],
+        "hits": hits,
+    }})
+
+
+def summarize_dataframe(uri, df, kind):
+    out["available"] = True
+    info = {{
+        "uri": uri,
+        "kind": kind,
+        "shape": list(getattr(df, "shape", ("?", "?"))),
+        "columns": [str(c) for c in list(getattr(df, "columns", []))[:80]],
+    }}
+    try:
+        info["dtypes"] = {{str(k): str(v) for k, v in df.dtypes.astype(str).to_dict().items()}}
+    except Exception:
+        pass
+    try:
+        info["head"] = json.loads(df.head(8).to_json(orient="records", date_format="iso"))
+    except Exception:
+        info["head"] = str(df.head(8))[:2500]
+    out["summaries"].append(info)
+
+
+def summarize_file(uri):
+    lower = uri.lower()
+    data = None
+    if any(lower.endswith(ext) for ext in (".csv", ".txt", ".json", ".md", ".log")):
+        data = read_bytes(uri)
+        if data:
+            if lower.endswith(".csv") and pd is not None:
+                try:
+                    df = pd.read_csv(io.BytesIO(data), nrows=80)
+                    summarize_dataframe(uri, df, "csv_sample")
+                    return
+                except Exception as exc:
+                    out["errors"].append(f"csv parse {{uri}} failed: {{exc}}")
+            summarize_text(uri, data)
+        return
+
+    if lower.endswith(".parquet"):
+        if open_file is not None and pq is not None:
+            try:
+                with open_file(uri, "rb") as stream:
+                    parquet = pq.ParquetFile(stream)
+                    meta = parquet.metadata
+                    schema = [str(name) for name in parquet.schema.names[:80]]
+                    batch = next(parquet.iter_batches(batch_size=40), None)
+                    summary = {{
+                        "uri": uri,
+                        "kind": "parquet_metadata",
+                        "num_rows": meta.num_rows if meta else None,
+                        "num_columns": meta.num_columns if meta else None,
+                        "columns": schema,
+                    }}
+                    if batch is not None:
+                        try:
+                            df = batch.to_pandas()
+                            summary["sample"] = json.loads(df.head(8).to_json(orient="records", date_format="iso"))
+                        except Exception as exc:
+                            summary["sample_error"] = str(exc)
+                    out["available"] = True
+                    out["summaries"].append(summary)
+                    return
+            except Exception as exc:
+                out["errors"].append(f"parquet metadata {{uri}} failed: {{exc}}")
+        if pd is not None:
+            try:
+                with open_file(uri, "rb") as stream:
+                    df = pd.read_parquet(stream)
+                summarize_dataframe(uri, df.head(80), "parquet_sample")
+            except Exception as exc:
+                out["errors"].append(f"parquet pandas {{uri}} failed: {{exc}}")
+        return
+
+    if lower.endswith((".pkl", ".pickle")):
+        data = read_bytes(uri, max_bytes=25000000)
+        if data:
+            try:
+                obj = pickle.loads(data)
+                summary = {{"uri": uri, "kind": "pickle", "type": type(obj).__name__}}
+                if pd is not None and hasattr(obj, "head") and hasattr(obj, "columns"):
+                    summary["shape"] = list(getattr(obj, "shape", ("?", "?")))
+                    summary["columns"] = [str(c) for c in list(obj.columns)[:80]]
+                    summary["head"] = json.loads(obj.head(8).to_json(orient="records", date_format="iso"))
+                else:
+                    summary["repr"] = repr(obj)[:2500]
+                out["available"] = True
+                out["summaries"].append(summary)
+            except Exception as exc:
+                out["errors"].append(f"pickle parse {{uri}} failed: {{exc}}")
+        return
+
+    if lower.endswith(".pdf"):
+        data = read_bytes(uri, max_bytes=1000000)
+        if data:
+            try:
+                from pypdf import PdfReader
+                reader = PdfReader(io.BytesIO(data))
+                text = "\\n".join((page.extract_text() or "") for page in reader.pages[:4])
+                summarize_text(uri, text.encode("utf-8", errors="replace"))
+            except Exception as exc:
+                out["errors"].append(f"pdf parse {{uri}} failed: {{exc}}")
+        return
+
+
+all_entries = []
+for uri in candidate_paths[:60]:
+    entries = list_entries(uri)
+    all_entries.extend(entries)
+
+direct_candidates = list(candidate_paths)
+ranked_entries = sorted(set(all_entries), key=score_path, reverse=True)
+for entry in ranked_entries:
+    if score_path(entry) > 0 or any(str(entry).lower().endswith(ext) for ext in (".csv", ".parquet", ".pkl", ".pickle", ".txt", ".json", ".pdf")):
+        direct_candidates.append(entry)
+
+seen = set()
+for uri in direct_candidates:
+    if uri in seen:
+        continue
+    seen.add(uri)
+    if len(out["summaries"]) >= 12:
+        break
+    summarize_file(uri)
+
+print(json.dumps(out, ensure_ascii=True, default=str))
+"""
+
+
+def _sparrow_data_env(input: Input) -> dict[str, str]:
+    env = os.environ.copy()
+    if input.access_key:
+        env[
+            "SPARROW_FLOW_IO_S3__TENANTS__default__STATIC_CREDENTIALS__ACCESS_KEY"
+        ] = input.access_key
+        env["SPARROW_FLOW_IO_OBJS__ACCESS_KEY"] = input.access_key
+        env["SPARROW_OBJS_ACCESS_KEY_ID"] = input.access_key
+    if input.secret_key:
+        env[
+            "SPARROW_FLOW_IO_S3__TENANTS__default__STATIC_CREDENTIALS__SECRET_KEY"
+        ] = input.secret_key
+        env["SPARROW_FLOW_IO_OBJS__SECRET_KEY"] = input.secret_key
+        env["SPARROW_OBJS_SECRET_ACCESS_KEY"] = input.secret_key
+    if input.token_sparrow:
+        env["SPARROW_TOKEN"] = input.token_sparrow
+    return env
+
+
+def _run_agent_python(code: str, env: dict[str, str], timeout: int = 90) -> dict[str, Any]:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, encoding="utf-8") as handle:
+        handle.write(code)
+        tmp_path = Path(handle.name)
+    try:
+        completed = subprocess.run(
+            [sys.executable, str(tmp_path)],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return {"stdout": "", "stderr": f"timed out after {timeout}s", "exit_code": -1}
+    except Exception as exc:
+        return {"stdout": "", "stderr": str(exc), "exit_code": -1}
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    stdout = _truncate(completed.stdout, MAX_DATASET_OUTPUT_CHARS)
+    parsed: Any = None
+    if stdout.strip():
+        try:
+            parsed = json.loads(stdout)
+        except json.JSONDecodeError:
+            parsed = None
+    return {
+        "stdout": stdout,
+        "parsed": parsed,
+        "stderr": _truncate(completed.stderr, 8000),
+        "exit_code": completed.returncode,
+    }
+
+
 def _evidence_sufficiency_judge(
     input: Input,
     snapshot: RepoSnapshot,
@@ -685,6 +1242,8 @@ def _evidence_sufficiency_judge(
         "not_known_reason": "",
         "additional_files": [],
         "additional_search_queries": [],
+        "additional_dataset_paths": [],
+        "additional_dataset_terms": [],
         "confidence_ceiling": "medium",
         "rationale": "Fallback sufficiency judgement.",
     }
@@ -704,12 +1263,16 @@ Return JSON only:
   "not_known_reason": "",
   "additional_files": ["relative/path.py"],
   "additional_search_queries": ["query"],
+  "additional_dataset_paths": ["data/legal-report"],
+  "additional_dataset_terms": ["granting score"],
   "confidence_ceiling": "low" | "medium" | "high",
   "rationale": "brief reason"
 }
 Mark not_known only when the evidence and repository inventory indicate the
 requested fact is absent or external. Request execution for runtime outputs,
 computed values, tests, or behavior that static evidence cannot settle.
+Request additional_dataset_paths/additional_dataset_terms when the Sparrow dataset
+is relevant but the current dataset probe did not retrieve enough information.
 """.strip(),
         },
         {
@@ -735,8 +1298,13 @@ Evidence packet:
     return {**fallback, **parsed}
 
 
-def _collect_requested_evidence(snapshot: RepoSnapshot, sufficiency: dict[str, Any]) -> dict[str, Any]:
-    collected: dict[str, Any] = {"files": [], "searches": []}
+def _collect_requested_evidence(
+    input: Input,
+    snapshot: RepoSnapshot,
+    question: Any,
+    sufficiency: dict[str, Any],
+) -> dict[str, Any]:
+    collected: dict[str, Any] = {"files": [], "searches": [], "dataset": None}
     files = sufficiency.get("additional_files", [])
     if isinstance(files, str):
         files = [files]
@@ -752,6 +1320,24 @@ def _collect_requested_evidence(snapshot: RepoSnapshot, sufficiency: dict[str, A
         for query in queries[:6]:
             if str(query).strip():
                 collected["searches"].append(_tool_search(snapshot.root, str(query).strip()))
+
+    dataset_paths = sufficiency.get("additional_dataset_paths", [])
+    dataset_terms = sufficiency.get("additional_dataset_terms", [])
+    if dataset_paths or dataset_terms:
+        plan = {
+            "use_dataset": True,
+            "reason": "Additional dataset evidence requested by sufficiency judge.",
+            "paths": dataset_paths if isinstance(dataset_paths, list) else [dataset_paths],
+            "search_terms": dataset_terms if isinstance(dataset_terms, list) else [dataset_terms],
+            "calculations": [],
+        }
+        candidates = _dataset_candidate_paths(getattr(question, "question", ""), plan)
+        collected["dataset"] = _probe_sparrow_dataset(
+            input,
+            getattr(question, "question", ""),
+            candidates,
+            plan,
+        )
     return collected
 
 
@@ -760,7 +1346,9 @@ def _sufficiency_requests_more_evidence(sufficiency: dict[str, Any]) -> bool:
         return False
     files = sufficiency.get("additional_files", [])
     queries = sufficiency.get("additional_search_queries", [])
-    return bool(files) or bool(queries)
+    dataset_paths = sufficiency.get("additional_dataset_paths", [])
+    dataset_terms = sufficiency.get("additional_dataset_terms", [])
+    return bool(files) or bool(queries) or bool(dataset_paths) or bool(dataset_terms)
 
 
 def _sufficiency_requests_execution(sufficiency: dict[str, Any]) -> bool:
@@ -803,6 +1391,14 @@ one repository question. Return JSON only:
 Use at most two actions. Prefer small Python snippets that import/call the relevant
 code or inspect data. Use run_notebook for notebook-output questions. Do not run
 destructive commands or long services.
+For Sparrow dataset computations, run_python may use:
+  from sparrow_flow.io.functional import open_file
+  from sparrow_flow.io.path import create_path
+  import pandas as pd
+Known dataset paths include ds-hackathon/data/granting_score,
+ds-hackathon/data/granting-score, ds-hackathon/data/legal-report, and
+Perimeter_Data_Updated_20250221 csv/parquet. Credentials are provided through
+environment variables.
 Return {"actions": []} if execution is not necessary after reading the evidence.
 """.strip(),
         },
