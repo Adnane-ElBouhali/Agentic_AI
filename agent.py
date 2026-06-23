@@ -30,6 +30,8 @@ DEFAULT_MODEL = "mistral-medium-2508"
 
 MAX_CONTEXT_CHARS = 120_000
 MAX_QUESTION_CONTEXT_CHARS = 80_000
+MAX_EVIDENCE_CHARS = 130_000
+MAX_AGENT_CONTEXT_CHARS = 90_000
 MAX_FILE_CHARS = 12_000
 MAX_TOOL_OUTPUT_CHARS = 18_000
 MAX_TOOL_ROUNDS = 3
@@ -481,27 +483,443 @@ def _answer_with_tools(input: Input, snapshot: RepoSnapshot) -> list[dict[str, A
 
 
 def _answer_one_question(input: Input, snapshot: RepoSnapshot, question: Any) -> list[dict[str, Any]]:
+    classification = _classify_question(input, snapshot, question)
+    evidence = _collect_evidence(snapshot, question, classification)
+    execution_results = _execution_agent(input, snapshot, question, classification, evidence)
+    if execution_results:
+        evidence = _append_evidence_section(
+            evidence,
+            "Execution Results",
+            json.dumps(execution_results, ensure_ascii=True, indent=2),
+        )
+
+    draft = _draft_answer(input, snapshot, question, classification, evidence)
+    reviewed = _critic_review(input, snapshot, question, classification, evidence, draft)
+    answer = reviewed or draft
+    if _answer_matches_question(answer, question.id):
+        return [answer]
+    return []
+
+
+def _classify_question(input: Input, snapshot: RepoSnapshot, question: Any) -> dict[str, Any]:
+    question_text = getattr(question, "question", "")
+    fallback = _fallback_classification(snapshot, question_text, input.code_execution)
     messages = [
-        {"role": "system", "content": _system_prompt(input.code_execution)},
-        {"role": "user", "content": _question_prompt(input, snapshot, question)},
+        {
+            "role": "system",
+            "content": """
+You are the Classifier Agent in a repository QA challenge.
+Classify the question before anyone answers it. Choose the safest approach:
+source_analysis, execution_required, or probably_not_known.
+Return JSON only.
+Schema:
+{
+  "question_type": "source_analysis" | "execution_required" | "probably_not_known",
+  "execution_needed": true,
+  "answerability": "likely_answerable" | "uncertain" | "likely_not_known",
+  "files_to_read": ["relative/path.py"],
+  "search_queries": ["specific query"],
+  "risk_notes": "short note about hallucination/confidence risk"
+}
+Prefer execution_required for runtime output, computed values, tests, shapes, printed
+results, or behavior that static reading may mispredict. Prefer probably_not_known
+when the requested fact sounds external to the repo.
+""".strip(),
+        },
+        {
+            "role": "user",
+            "content": _limit_text(
+                f"""
+Template: {input.template_title}
+Question id={question.id}: {question_text}
+
+Heuristic hint:
+{_question_hints(question_text, input.code_execution)}
+
+Repository metadata:
+{snapshot.metadata}
+
+Repository tree:
+{snapshot.tree}
+
+Source symbol index:
+{snapshot.symbols}
+
+Pre-search hits:
+{_question_search_context(snapshot, question_text)}
+
+Targeted snippets:
+{_question_context(snapshot, question_text)}
+""".strip(),
+                MAX_AGENT_CONTEXT_CHARS,
+            ),
+        },
     ]
+    parsed = _safe_call_and_parse_json(input, messages, fallback)
+    return {**fallback, **parsed}
 
-    parsed: dict[str, Any] = {}
-    for round_index in range(MAX_TOOL_ROUNDS + 1):
-        parsed = _call_and_parse_json(input, messages)
 
-        actions = parsed.get("actions") or []
-        if round_index >= MAX_TOOL_ROUNDS or not actions:
-            break
+def _collect_evidence(snapshot: RepoSnapshot, question: Any, classification: dict[str, Any]) -> str:
+    question_text = getattr(question, "question", "")
+    sections = ""
+    sections = _append_evidence_section(sections, "Question", f"id={question.id}: {question_text}")
+    sections = _append_evidence_section(
+        sections,
+        "Classifier Result",
+        json.dumps(classification, ensure_ascii=True, indent=2),
+    )
+    sections = _append_evidence_section(sections, "Approach Hint", _question_hints(question_text, True))
+    sections = _append_evidence_section(sections, "Repository Metadata", snapshot.metadata)
+    sections = _append_evidence_section(sections, "Repository Tree", snapshot.tree)
+    sections = _append_evidence_section(sections, "Source Symbol Index", snapshot.symbols)
+    sections = _append_evidence_section(
+        sections,
+        "Pre-search Hits",
+        _question_search_context(snapshot, question_text),
+    )
 
-        tool_results = _run_actions(snapshot.root, actions, input.code_execution)
-        messages.append({"role": "assistant", "content": json.dumps(parsed, ensure_ascii=True)})
-        messages.append({"role": "user", "content": _tool_result_prompt(question, tool_results)})
+    queries = _evidence_queries(question_text, classification)
+    search_results = []
+    for query in queries[:6]:
+        search_results.append(_tool_search(snapshot.root, query))
+    sections = _append_evidence_section(
+        sections,
+        "Search Results",
+        json.dumps(search_results, ensure_ascii=True, indent=2),
+    )
 
-    answers = parsed.get("answers")
-    if not isinstance(answers, list):
+    file_reads = []
+    for rel_path in _evidence_files(snapshot, question_text, classification):
+        result = _tool_read_file(snapshot.root, rel_path)
+        file_reads.append(result)
+    sections = _append_evidence_section(
+        sections,
+        "Selected File Contents",
+        json.dumps(file_reads, ensure_ascii=True, indent=2),
+    )
+
+    sections = _append_evidence_section(
+        sections,
+        "Targeted Repository Snippets",
+        _question_context(snapshot, question_text),
+    )
+    return sections
+
+
+def _execution_agent(
+    input: Input,
+    snapshot: RepoSnapshot,
+    question: Any,
+    classification: dict[str, Any],
+    evidence: str,
+) -> list[dict[str, Any]]:
+    if not input.code_execution:
         return []
-    return [answer for answer in answers if _answer_matches_question(answer, question.id)]
+    if not _should_execute(question.question, classification):
+        return []
+
+    messages = [
+        {
+            "role": "system",
+            "content": """
+You are the Execution Agent. Decide the minimal safe execution needed to answer
+one repository question. Return JSON only:
+{
+  "actions": [
+    {
+      "tool": "run_python" | "run_command",
+      "code": "python snippet for run_python",
+      "args": ["python", "script.py"] for run_command,
+      "reason": "why this execution is necessary"
+    }
+  ]
+}
+Use at most two actions. Prefer small Python snippets that import/call the relevant
+code or inspect data. Do not run destructive commands or long services.
+Return {"actions": []} if execution is not necessary after reading the evidence.
+""".strip(),
+        },
+        {
+            "role": "user",
+            "content": _limit_text(
+                f"""
+Question id={question.id}: {question.question}
+
+Classifier:
+{json.dumps(classification, ensure_ascii=True, indent=2)}
+
+Evidence:
+{evidence}
+""".strip(),
+                MAX_AGENT_CONTEXT_CHARS,
+            ),
+        },
+    ]
+    parsed = _safe_call_and_parse_json(input, messages, {"actions": []})
+    actions = parsed.get("actions")
+    if not isinstance(actions, list):
+        return []
+    executable_actions = [
+        action
+        for action in actions[:2]
+        if isinstance(action, dict) and action.get("tool") in {"run_python", "run_command"}
+    ]
+    return _run_actions(snapshot.root, executable_actions, input.code_execution)
+
+
+def _draft_answer(
+    input: Input,
+    snapshot: RepoSnapshot,
+    question: Any,
+    classification: dict[str, Any],
+    evidence: str,
+) -> dict[str, Any]:
+    fallback = _fallback_answer(question.id)
+    messages = [
+        {
+            "role": "system",
+            "content": """
+You are the Answer Agent. Write the best final answer from the evidence only.
+Return JSON only:
+{
+  "answers": [
+    {
+      "question": 123,
+      "answer": "concise complete answer",
+      "confidence": "low" | "medium" | "high",
+      "evidence": ["files"] or ["execution"] or ["files", "execution"] or [],
+      "not_known": false,
+      "source_paths": ["relative/path.py"]
+    }
+  ]
+}
+Do not invent missing facts. If evidence does not support the answer, return
+not_known=true, confidence="low", evidence=[], and explain that the repository
+does not contain enough information.
+""".strip(),
+        },
+        {
+            "role": "user",
+            "content": _limit_text(
+                f"""
+Question id={question.id}: {question.question}
+
+Classifier:
+{json.dumps(classification, ensure_ascii=True, indent=2)}
+
+Evidence packet:
+{evidence}
+""".strip(),
+                MAX_AGENT_CONTEXT_CHARS,
+            ),
+        },
+    ]
+    parsed = _safe_call_and_parse_json(input, messages, {"answers": [fallback]})
+    answer = _extract_single_answer(parsed, question.id)
+    return answer or fallback
+
+
+def _critic_review(
+    input: Input,
+    snapshot: RepoSnapshot,
+    question: Any,
+    classification: dict[str, Any],
+    evidence: str,
+    draft: dict[str, Any],
+) -> dict[str, Any]:
+    fallback = draft or _fallback_answer(question.id)
+    messages = [
+        {
+            "role": "system",
+            "content": """
+You are the Critic and Confidence Calibrator Agent for a judged hackathon.
+Your job is to prevent wrong, unsupported, overconfident, or underconfident answers.
+Return one corrected answer object as JSON only:
+{
+  "question": 123,
+  "answer": "corrected answer",
+  "confidence": "low" | "medium" | "high",
+  "evidence": ["files"] or ["execution"] or ["files", "execution"] or [],
+  "not_known": false,
+  "source_paths": ["relative/path.py"],
+  "critic_notes": "brief validation note"
+}
+Rules:
+- If the answer is not directly supported by evidence, set not_known=true.
+- High confidence requires direct source_paths or successful execution output.
+- Execution output plus matching source evidence can be high confidence.
+- Strong source evidence without execution is high only for static facts.
+- Partial inference is medium. Missing/ambiguous evidence is low.
+- Do not penalize correct answers with low confidence; calibrate honestly.
+""".strip(),
+        },
+        {
+            "role": "user",
+            "content": _limit_text(
+                f"""
+Question id={question.id}: {question.question}
+
+Classifier:
+{json.dumps(classification, ensure_ascii=True, indent=2)}
+
+Draft answer:
+{json.dumps(draft, ensure_ascii=True, indent=2)}
+
+Evidence packet:
+{evidence}
+""".strip(),
+                MAX_AGENT_CONTEXT_CHARS,
+            ),
+        },
+    ]
+    parsed = _safe_call_and_parse_json(input, messages, fallback)
+    answer = _extract_single_answer(parsed, question.id)
+    if answer is None and _answer_matches_question(parsed, question.id):
+        answer = parsed
+    return answer or fallback
+
+
+def _safe_call_and_parse_json(
+    input: Input,
+    messages: list[dict[str, str]],
+    fallback: dict[str, Any],
+) -> dict[str, Any]:
+    try:
+        parsed = _call_and_parse_json(input, messages)
+        return parsed if isinstance(parsed, dict) else fallback
+    except Exception as exc:
+        print(f"[agent] JSON agent failed: {exc}")
+        return fallback
+
+
+def _extract_single_answer(parsed: dict[str, Any], question_id: int) -> dict[str, Any] | None:
+    if _answer_matches_question(parsed, question_id):
+        return parsed
+    answer = parsed.get("answer")
+    if isinstance(answer, dict) and _answer_matches_question(answer, question_id):
+        return answer
+    answers = parsed.get("answers")
+    if isinstance(answers, list):
+        for item in answers:
+            if _answer_matches_question(item, question_id):
+                return item
+    return None
+
+
+def _fallback_answer(question_id: int) -> dict[str, Any]:
+    return {
+        "question": question_id,
+        "answer": "The available data did not support an answer.",
+        "confidence": "low",
+        "evidence": [],
+        "not_known": True,
+        "source_paths": [],
+    }
+
+
+def _fallback_classification(
+    snapshot: RepoSnapshot,
+    question_text: str,
+    code_execution: bool,
+) -> dict[str, Any]:
+    question_type = "source_analysis"
+    execution_needed = False
+    hint = _question_hints(question_text, code_execution)
+    if hint.startswith("Likely execution"):
+        question_type = "execution_required"
+        execution_needed = code_execution
+    elif "unanswerable" in hint:
+        question_type = "probably_not_known"
+
+    return {
+        "question_type": question_type,
+        "execution_needed": execution_needed,
+        "answerability": "uncertain",
+        "files_to_read": _ranked_question_paths(snapshot, question_text, 5),
+        "search_queries": _default_queries(question_text),
+        "risk_notes": hint,
+    }
+
+
+def _should_execute(question_text: str, classification: dict[str, Any]) -> bool:
+    if bool(classification.get("execution_needed")):
+        return True
+    if str(classification.get("question_type", "")).lower() == "execution_required":
+        return True
+    return _question_hints(question_text, True).startswith("Likely execution")
+
+
+def _evidence_queries(question_text: str, classification: dict[str, Any]) -> list[str]:
+    queries = []
+    raw_queries = classification.get("search_queries", [])
+    if isinstance(raw_queries, str):
+        raw_queries = [raw_queries]
+    if isinstance(raw_queries, list):
+        queries.extend(str(query).strip() for query in raw_queries if str(query).strip())
+    queries.extend(_default_queries(question_text))
+
+    deduped = []
+    for query in queries:
+        if query and query not in deduped:
+            deduped.append(query)
+    return deduped
+
+
+def _default_queries(question_text: str) -> list[str]:
+    tokens = sorted(_tokenize(question_text))
+    queries = []
+    if question_text.strip():
+        queries.append(question_text.strip())
+    if tokens:
+        queries.append(" ".join(tokens[:8]))
+    for token in tokens[:5]:
+        queries.append(token)
+    return queries
+
+
+def _evidence_files(
+    snapshot: RepoSnapshot,
+    question_text: str,
+    classification: dict[str, Any],
+) -> list[str]:
+    paths = []
+    raw_paths = classification.get("files_to_read", [])
+    if isinstance(raw_paths, str):
+        raw_paths = [raw_paths]
+    if isinstance(raw_paths, list):
+        paths.extend(str(path).strip() for path in raw_paths if str(path).strip())
+    paths.extend(_ranked_question_paths(snapshot, question_text, 8))
+
+    deduped = []
+    for path in paths:
+        if path and path not in deduped:
+            deduped.append(path)
+    return deduped[:12]
+
+
+def _ranked_question_paths(snapshot: RepoSnapshot, question_text: str, limit: int) -> list[str]:
+    ranked = sorted(
+        snapshot.files,
+        key=lambda path: _question_file_priority(snapshot.root, path, question_text),
+        reverse=True,
+    )
+    return [_rel(snapshot.root, path) for path in ranked[:limit]]
+
+
+def _append_evidence_section(existing: str, title: str, body: str) -> str:
+    section = f"\n\n## {title}\n{body.strip() if body else '[empty]'}"
+    if len(existing) + len(section) <= MAX_EVIDENCE_CHARS:
+        return existing + section
+    remaining = MAX_EVIDENCE_CHARS - len(existing)
+    if remaining <= 80:
+        return existing
+    return existing + section[:remaining] + "\n... [evidence truncated]"
+
+
+def _limit_text(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n... [truncated: {len(text)} chars total]"
 
 
 def _system_prompt(code_execution: bool) -> str:
