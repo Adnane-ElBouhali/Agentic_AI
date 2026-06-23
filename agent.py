@@ -27,10 +27,53 @@ except ModuleNotFoundError as exc:
 
 
 DEFAULT_MODEL = "mistral-medium-2508"
+
 MAX_CONTEXT_CHARS = 120_000
+MAX_QUESTION_CONTEXT_CHARS = 80_000
 MAX_FILE_CHARS = 12_000
 MAX_TOOL_OUTPUT_CHARS = 18_000
 MAX_TOOL_ROUNDS = 3
+MAX_SEARCH_FILE_CHARS = 220_000
+MAX_SEARCH_MATCHES = 40
+MAX_SNIPPETS_PER_FILE = 4
+SEARCH_WINDOW_LINES = 2
+
+TOKEN_RE = re.compile(r"[a-zA-Z0-9_]{3,}")
+STOP_WORDS = {
+    "about",
+    "after",
+    "all",
+    "also",
+    "and",
+    "answer",
+    "are",
+    "can",
+    "code",
+    "does",
+    "file",
+    "find",
+    "for",
+    "from",
+    "has",
+    "how",
+    "into",
+    "its",
+    "not",
+    "question",
+    "repo",
+    "repository",
+    "return",
+    "should",
+    "that",
+    "the",
+    "this",
+    "use",
+    "what",
+    "when",
+    "where",
+    "which",
+    "with",
+}
 
 TEXT_EXTENSIONS = {
     ".bat",
@@ -112,6 +155,7 @@ class RepoSnapshot:
     root: Path
     tree: str
     context: str
+    files: list[Path]
 
 
 def predict(input: Input) -> List[AnswerItem]:
@@ -173,7 +217,7 @@ def _build_snapshot(root: Path, questions: Iterable[Any]) -> RepoSnapshot:
         chunks.append(chunk)
         total += len(chunk)
 
-    return RepoSnapshot(root=root, tree=tree, context="".join(chunks))
+    return RepoSnapshot(root=root, tree=tree, context="".join(chunks), files=files)
 
 
 def _iter_files(root: Path) -> Iterable[Path]:
@@ -216,12 +260,94 @@ def _format_tree(root: Path, files: list[Path]) -> str:
 def _file_priority(root: Path, path: Path, question_text: str) -> tuple[int, int, int, int, str]:
     rel = _rel(root, path).lower()
     name = path.name.lower()
-    tokens = {token for token in re.findall(r"[a-zA-Z0-9_]{3,}", question_text.lower())}
+    tokens = _tokenize(question_text)
     token_hits = sum(1 for token in tokens if token in rel)
     important_name = int(name in IMPORTANT_NAMES or name.startswith("readme"))
     source_or_doc = int(path.suffix.lower() in {".py", ".md", ".txt", ".ipynb", ".toml", ".yaml", ".yml"})
     size_score = -min(path.stat().st_size, MAX_FILE_CHARS)
     return token_hits, important_name, source_or_doc, size_score, rel
+
+
+def _question_file_priority(root: Path, path: Path, question_text: str) -> tuple[int, int, int, int, str]:
+    rel = _rel(root, path).lower()
+    name = path.name.lower()
+    tokens = _tokenize(question_text)
+    path_hits = sum(4 for token in tokens if token in rel)
+    important_name = int(name in IMPORTANT_NAMES or name.startswith("readme"))
+    source_or_doc = int(path.suffix.lower() in {".py", ".md", ".txt", ".ipynb", ".toml", ".yaml", ".yml"})
+    text = _read_text(path, MAX_SEARCH_FILE_CHARS).lower()
+    content_hits = sum(min(text.count(token), 8) for token in tokens)
+    size_score = -min(path.stat().st_size, MAX_FILE_CHARS)
+    return path_hits + content_hits, important_name, source_or_doc, size_score, rel
+
+
+def _question_context(snapshot: RepoSnapshot, question_text: str) -> str:
+    ranked = sorted(
+        snapshot.files,
+        key=lambda path: _question_file_priority(snapshot.root, path, question_text),
+        reverse=True,
+    )
+    tokens = _tokenize(question_text)
+
+    chunks: list[str] = []
+    total = 0
+    for index, path in enumerate(ranked):
+        if total >= MAX_QUESTION_CONTEXT_CHARS:
+            break
+
+        rel = _rel(snapshot.root, path)
+        snippets = _extract_relevant_snippets(path, tokens)
+        if snippets:
+            content = "\n\n".join(snippets)
+            chunk = f"\n--- RELEVANT SNIPPETS: {rel} ---\n{content}\n"
+        elif index < 8:
+            content = _read_text(path, min(MAX_FILE_CHARS, MAX_QUESTION_CONTEXT_CHARS - total))
+            if not content:
+                continue
+            chunk = f"\n--- FILE: {rel} ---\n{content}\n"
+        else:
+            continue
+
+        remaining = MAX_QUESTION_CONTEXT_CHARS - total
+        if len(chunk) > remaining:
+            chunk = chunk[:remaining] + "\n... [question context truncated]"
+        chunks.append(chunk)
+        total += len(chunk)
+
+    if chunks:
+        return "".join(chunks)
+    return snapshot.context
+
+
+def _extract_relevant_snippets(path: Path, tokens: set[str]) -> list[str]:
+    if not tokens:
+        return []
+
+    text = _read_text(path, MAX_SEARCH_FILE_CHARS)
+    lines = text.splitlines()
+    scored: list[tuple[int, int]] = []
+    for line_number, line in enumerate(lines):
+        line_lower = line.lower()
+        score = sum(1 for token in tokens if token in line_lower)
+        if score:
+            scored.append((score, line_number))
+
+    snippets: list[str] = []
+    used_ranges: list[tuple[int, int]] = []
+    for _, line_number in sorted(scored, reverse=True):
+        if len(snippets) >= MAX_SNIPPETS_PER_FILE:
+            break
+        start = max(0, line_number - SEARCH_WINDOW_LINES)
+        end = min(len(lines), line_number + SEARCH_WINDOW_LINES + 1)
+        if any(not (end <= used_start or start >= used_end) for used_start, used_end in used_ranges):
+            continue
+        used_ranges.append((start, end))
+        body = "\n".join(
+            f"{idx + 1}: {lines[idx][:600]}" for idx in range(start, end)
+        )
+        snippets.append(body)
+
+    return snippets
 
 
 def _read_text(path: Path, max_chars: int = MAX_FILE_CHARS) -> str:
@@ -252,15 +378,21 @@ def _clean_notebook_json(path: Path, text: str) -> str:
 
 
 def _answer_with_tools(input: Input, snapshot: RepoSnapshot) -> list[dict[str, Any]]:
+    answers: list[dict[str, Any]] = []
+    for question in input.template:
+        answers.extend(_answer_one_question(input, snapshot, question))
+    return answers
+
+
+def _answer_one_question(input: Input, snapshot: RepoSnapshot, question: Any) -> list[dict[str, Any]]:
     messages = [
         {"role": "system", "content": _system_prompt(input.code_execution)},
-        {"role": "user", "content": _initial_prompt(input, snapshot)},
+        {"role": "user", "content": _question_prompt(input, snapshot, question)},
     ]
 
     parsed: dict[str, Any] = {}
     for round_index in range(MAX_TOOL_ROUNDS + 1):
-        content = _call_llm(input, messages)
-        parsed = _parse_json(content)
+        parsed = _call_and_parse_json(input, messages)
 
         actions = parsed.get("actions") or []
         if round_index >= MAX_TOOL_ROUNDS or not actions:
@@ -268,10 +400,12 @@ def _answer_with_tools(input: Input, snapshot: RepoSnapshot) -> list[dict[str, A
 
         tool_results = _run_actions(snapshot.root, actions, input.code_execution)
         messages.append({"role": "assistant", "content": json.dumps(parsed, ensure_ascii=True)})
-        messages.append({"role": "user", "content": _tool_result_prompt(tool_results)})
+        messages.append({"role": "user", "content": _tool_result_prompt(question, tool_results)})
 
     answers = parsed.get("answers")
-    return answers if isinstance(answers, list) else []
+    if not isinstance(answers, list):
+        return []
+    return [answer for answer in answers if _answer_matches_question(answer, question.id)]
 
 
 def _system_prompt(code_execution: bool) -> str:
@@ -304,48 +438,63 @@ Return JSON only. The JSON schema is:
       "answer": "direct, complete answer",
       "confidence": "low" | "medium" | "high",
       "evidence": ["files"] or ["files", "execution"] or ["execution"] or [],
-      "not_known": false
+      "not_known": false,
+      "source_paths": ["relative/path.py"]
     }}
   ]
 }}
 
-If more information is needed, return actions and provisional answers if useful.
+You will normally answer one question at a time. If more information is needed,
+return actions and provisional answers if useful.
 If the answer cannot be found in the repository or tool results, set not_known true,
 confidence low, evidence to [], and explain briefly that the available data does not
 support the answer. Do not hallucinate.
 Calibrate confidence: high only for direct evidence or successful execution, medium
 for strong inference, low for partial or missing evidence.
+Use source_paths for your own grounding; the final API may ignore it.
 """.strip()
 
 
-def _initial_prompt(input: Input, snapshot: RepoSnapshot) -> str:
-    questions = "\n".join(
-        f"- id={question.id}: {question.question}" for question in input.template
-    )
+def _question_prompt(input: Input, snapshot: RepoSnapshot, question: Any) -> str:
+    question_text = getattr(question, "question", "")
+    context = _question_context(snapshot, question_text)
     return f"""
 Template: {input.template_title}
 
-Questions:
-{questions}
+Question:
+- id={question.id}: {question_text}
 
 Repository tree:
 {snapshot.tree}
 
-Selected repository contents:
-{snapshot.context}
+Targeted repository contents:
+{context}
 
-Answer every question id exactly once. Prefer concise but complete answers.
+Answer question id {question.id} exactly once. Prefer concise but complete answers.
 """.strip()
 
 
-def _tool_result_prompt(results: list[dict[str, Any]]) -> str:
+def _tool_result_prompt(question: Any, results: list[dict[str, Any]]) -> str:
     return f"""
+Question:
+- id={question.id}: {question.question}
+
 Tool results:
 {json.dumps(results, ensure_ascii=True, indent=2)}
 
-Use these results to either answer all questions or request only the next essential
-actions. Return JSON only with the required schema.
+Use these results to either answer this question or request only the next essential
+actions. Return JSON only with the required schema. The answers array must contain
+only question id {question.id}.
 """.strip()
+
+
+def _answer_matches_question(answer: Any, question_id: int) -> bool:
+    if not isinstance(answer, dict):
+        return False
+    try:
+        return int(answer.get("question")) == int(question_id)
+    except (TypeError, ValueError):
+        return False
 
 
 def _call_llm(input: Input, messages: list[dict[str, str]]) -> str:
@@ -370,6 +519,26 @@ def _call_llm(input: Input, messages: list[dict[str, str]]) -> str:
             last_error = exc
             print(f"[agent] LLM call failed: {exc}")
     raise RuntimeError(f"LLM call failed after retries: {last_error}")
+
+
+def _call_and_parse_json(input: Input, messages: list[dict[str, str]]) -> dict[str, Any]:
+    content = _call_llm(input, messages)
+    try:
+        return _parse_json(content)
+    except RuntimeError:
+        repair_messages = [
+            *messages,
+            {"role": "assistant", "content": content},
+            {
+                "role": "user",
+                "content": (
+                    "Your previous response was not valid JSON for the required schema. "
+                    "Return only corrected JSON. Do not add markdown or commentary."
+                ),
+            },
+        ]
+        repaired = _call_llm(input, repair_messages)
+        return _parse_json(repaired)
 
 
 def _client(input: Input) -> Any:
@@ -437,6 +606,14 @@ def _parse_json(content: str) -> dict[str, Any]:
     raise RuntimeError(f"Could not parse LLM JSON response: {content[:500]}")
 
 
+def _tokenize(text: str) -> set[str]:
+    return {
+        token
+        for token in TOKEN_RE.findall(text.lower())
+        if token not in STOP_WORDS and not token.isdigit()
+    }
+
+
 def _run_actions(root: Path, actions: list[Any], code_execution: bool) -> list[dict[str, Any]]:
     results = []
     for action in actions[:8]:
@@ -480,29 +657,56 @@ def _tool_search(root: Path, query: str) -> dict[str, Any]:
     if not query:
         return {"error": "empty search query"}
 
-    matches = []
+    matches: list[dict[str, Any]] = []
     lowered = query.lower()
+    tokens = _tokenize(query)
     for path in _iter_files(root):
-        text = _read_text(path, MAX_TOOL_OUTPUT_CHARS)
-        for line_number, line in enumerate(text.splitlines(), start=1):
-            if lowered in line.lower():
-                matches.append(
-                    {
-                        "path": _rel(root, path),
-                        "line": line_number,
-                        "text": line[:500],
-                    }
-                )
+        text = _read_text(path, MAX_SEARCH_FILE_CHARS)
+        lines = text.splitlines()
+        file_matches: list[dict[str, Any]] = []
+        used_ranges: list[tuple[int, int]] = []
+
+        for index, line in enumerate(lines):
+            line_lower = line.lower()
+            score = 0
+            if lowered and lowered in line_lower:
+                score += 12
+            score += sum(1 for token in tokens if token in line_lower)
+            if score == 0:
+                continue
+
+            start = max(0, index - SEARCH_WINDOW_LINES)
+            end = min(len(lines), index + SEARCH_WINDOW_LINES + 1)
+            if any(not (end <= used_start or start >= used_end) for used_start, used_end in used_ranges):
+                continue
+            used_ranges.append((start, end))
+            snippet = "\n".join(
+                f"{line_index + 1}: {lines[line_index][:600]}"
+                for line_index in range(start, end)
+            )
+            file_matches.append(
+                {
+                    "score": score,
+                    "path": _rel(root, path),
+                    "line": index + 1,
+                    "snippet": snippet,
+                }
+            )
+            if len(file_matches) >= MAX_SNIPPETS_PER_FILE:
                 break
-        if len(matches) >= 25:
-            break
-    return {"query": query, "matches": matches}
+
+        matches.extend(file_matches)
+
+    matches.sort(key=lambda match: (match["score"], match["path"], -match["line"]), reverse=True)
+    for match in matches:
+        match.pop("score", None)
+    return {"query": query, "matches": matches[:MAX_SEARCH_MATCHES]}
 
 
 def _tool_run_python(root: Path, code: str) -> dict[str, str | int]:
     if not code.strip():
         return {"error": "empty python code"}
-    return _run_subprocess(root, [sys.executable, "-c", code], timeout=40)
+    return _run_subprocess(root, [_python_for_repo(root), "-c", code], timeout=40)
 
 
 def _tool_run_command(root: Path, args: Any) -> dict[str, str | int]:
@@ -528,9 +732,26 @@ def _tool_run_command(root: Path, args: Any) -> dict[str, str | int]:
         return {"error": f"command not allowed: {args[0]}"}
 
     if executable in {"python", "python3"}:
-        args = [sys.executable, *args[1:]]
+        args = [_python_for_repo(root), *args[1:]]
+    elif executable == "pytest":
+        args = [_python_for_repo(root), "-m", "pytest", *args[1:]]
 
     return _run_subprocess(root, args, timeout=80)
+
+
+def _python_for_repo(root: Path) -> str:
+    candidates = [
+        root / ".venv" / "bin" / "python",
+        root / "venv" / "bin" / "python",
+        root / "env" / "bin" / "python",
+        root / ".venv" / "Scripts" / "python.exe",
+        root / "venv" / "Scripts" / "python.exe",
+        root / "env" / "Scripts" / "python.exe",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return sys.executable
 
 
 def _run_subprocess(root: Path, args: list[str], timeout: int) -> dict[str, str | int]:
@@ -582,8 +803,10 @@ def _coerce_answers(input: Input, raw_answers: list[dict[str, Any]]) -> List[Ans
         if not answer_text:
             answer_text = "The available data did not support an answer."
             not_known = True
-            confidence = "low"
-            evidence = []
+        if _looks_unknown_answer(answer_text):
+            not_known = True
+
+        confidence, evidence = _calibrate(confidence, evidence, not_known)
 
         results.append(
             AnswerItem(
@@ -636,6 +859,29 @@ def _normalize_evidence(value: Any) -> list[str]:
         if item_text in {"files", "execution"} and item_text not in evidence:
             evidence.append(item_text)
     return evidence
+
+
+def _calibrate(confidence: str, evidence: list[str], not_known: bool) -> tuple[str, list[str]]:
+    if not_known:
+        return "low", []
+    if "execution" in evidence and confidence == "low":
+        return "medium", evidence
+    if "files" in evidence and "execution" in evidence and confidence == "medium":
+        return "high", evidence
+    return confidence, evidence
+
+
+def _looks_unknown_answer(answer: str) -> bool:
+    lowered = answer.lower()
+    unknown_markers = (
+        "available data did not support",
+        "cannot be found",
+        "can't be found",
+        "not enough information",
+        "not present in the repository",
+        "unknown",
+    )
+    return any(marker in lowered for marker in unknown_markers)
 
 
 def _truncate(text: str, limit: int = MAX_TOOL_OUTPUT_CHARS) -> str:
