@@ -67,7 +67,7 @@ MAX_AGENT_CONTEXT_CHARS = 90_000
 MAX_FILE_CHARS = 12_000
 MAX_TOOL_OUTPUT_CHARS = 18_000
 MAX_TOOL_ROUNDS = 3
-MAX_DATASET_OUTPUT_CHARS = 45_000
+MAX_DATASET_OUTPUT_CHARS = 70_000
 MAX_SEARCH_FILE_CHARS = 220_000
 MAX_SEARCH_MATCHES = 40
 MAX_SNIPPETS_PER_FILE = 4
@@ -620,8 +620,16 @@ def _answer_one_question(input: Input, snapshot: RepoSnapshot, question: Any) ->
     classification = _classify_question(input, snapshot, question)
     evidence = _collect_evidence(snapshot, question, classification)
     dataset_evidence = _dataset_investigator(input, snapshot, question, classification)
+    dataset_answer: dict[str, Any] | None = None
     if dataset_evidence:
         evidence = _append_evidence_section(evidence, "Sparrow Dataset Evidence", dataset_evidence)
+        dataset_answer = _dataset_answer_agent(input, question, classification, dataset_evidence)
+        if _dataset_answer_is_useful(dataset_answer):
+            evidence = _append_evidence_section(
+                evidence,
+                "Dataset Specialist Answer",
+                json.dumps(dataset_answer, ensure_ascii=True, indent=2),
+            )
     sufficiency = _evidence_sufficiency_judge(input, snapshot, question, classification, evidence)
     evidence = _append_evidence_section(
         evidence,
@@ -663,6 +671,11 @@ def _answer_one_question(input: Input, snapshot: RepoSnapshot, question: Any) ->
         )
 
     if _sufficiency_marks_not_known(sufficiency):
+        if _dataset_answer_is_useful(dataset_answer):
+            verified = _adversarial_verify(input, snapshot, question, classification, evidence, dataset_answer)
+            answer = _confidence_calibrator(input, snapshot, question, classification, evidence, verified)
+            if _answer_matches_question(answer, question.id):
+                return [answer]
         answer = _fallback_answer(question.id)
         answer["answer"] = str(
             sufficiency.get(
@@ -861,6 +874,79 @@ Dataset probe result:
 """.strip(),
         MAX_DATASET_OUTPUT_CHARS,
     )
+
+
+def _dataset_answer_agent(
+    input: Input,
+    question: Any,
+    classification: dict[str, Any],
+    dataset_evidence: str,
+) -> dict[str, Any]:
+    fallback = _fallback_answer(question.id)
+    messages = [
+        {
+            "role": "system",
+            "content": """
+You are the Sparrow Dataset Specialist for a judged QA challenge.
+Answer only from the provided Sparrow dataset probe evidence. This evidence may
+contain CSV/parquet/pickle summaries, dataframe shapes, columns, head rows, text
+hits, listed paths, and Python execution errors.
+
+Return one JSON answer object only:
+{
+  "question": 123,
+  "answer": "concise answer grounded in the dataset summaries",
+  "confidence": "low" | "medium" | "high",
+  "evidence": ["execution"],
+  "not_known": false,
+  "source_paths": ["s3://dataset/path.csv"],
+  "dataset_notes": "which summaries/columns/rows support the answer"
+}
+
+Rules:
+- Use exact column names, filenames, numeric values, row counts, shapes, or text
+  hits when they are present.
+- For granting score/legal report questions, prefer dataset evidence over repo
+  guesses.
+- High confidence requires a direct dataframe/text summary that answers the
+  question. Medium confidence is for a strong but partial dataset signal.
+- If the probe did not read relevant data, return not_known=true, confidence=low,
+  evidence=[], source_paths=[].
+- Do not invent values not present in the probe evidence.
+""".strip(),
+        },
+        {
+            "role": "user",
+            "content": _limit_text(
+                f"""
+Question id={question.id}: {question.question}
+
+Classifier:
+{json.dumps(classification, ensure_ascii=True, indent=2)}
+
+Sparrow dataset probe evidence:
+{dataset_evidence}
+""".strip(),
+                MAX_AGENT_CONTEXT_CHARS,
+            ),
+        },
+    ]
+    parsed = _safe_call_and_parse_json(input, messages, fallback, "dataset")
+    answer = _extract_single_answer(parsed, question.id)
+    if answer is None and _answer_matches_question(parsed, question.id):
+        answer = parsed
+    return _deterministic_answer_calibration(answer or fallback)
+
+
+def _dataset_answer_is_useful(answer: dict[str, Any] | None) -> bool:
+    if not isinstance(answer, dict):
+        return False
+    if bool(answer.get("not_known")):
+        return False
+    if _looks_unknown_answer(str(answer.get("answer") or "")):
+        return False
+    evidence = _normalize_evidence(answer.get("evidence"))
+    return "execution" in evidence and bool(str(answer.get("answer") or "").strip())
 
 
 def _fallback_dataset_plan(question_text: str, classification: dict[str, Any]) -> dict[str, Any]:
@@ -1569,6 +1655,10 @@ Return JSON only:
 Do not invent missing facts. If evidence does not support the answer, return
 not_known=true, confidence="low", evidence=[], and explain that the repository
 does not contain enough information.
+If the evidence contains a "Dataset Specialist Answer" that is not not_known,
+use it as the primary draft for granting score, legal report, perimeter, scoring,
+or model-output questions unless other evidence contradicts it. Preserve exact
+dataset values, column names, shapes, filenames, and cited dataset paths.
 """.strip(),
         },
         {
