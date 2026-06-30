@@ -12,6 +12,19 @@ from typing import Any
 from openpyxl import load_workbook
 
 
+
+from datetime import date, datetime
+from decimal import Decimal
+
+
+def json_safe(value):
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return float(value)
+    return str(value)
+
+
 @dataclass
 class Change:
     category: str
